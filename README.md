@@ -30,6 +30,7 @@ capability is a small, readable module, not a framework call:
 | Capability | What it shows | Where |
 |---|---|---|
 | **Agentic retrieval** | Claude drives its own multi-hop retrieval loop; the user's clearance is bound at the **tool boundary**, so the model can't escalate — even under prompt injection | `agent.py` |
+| **MCP server** | The access-bound retriever exposed over the Model Context Protocol — any MCP client (Claude Desktop/Code, Cursor) can call it; principal bound at launch | `mcp_server.py` |
 | **Access-controlled retrieval** | Clearance + need-to-know enforced as a vector-store **pre-filter** — unauthorized docs never reach the model | `access.py`, `query.py` |
 | **Federated multi-silo retrieval** | Fan-out across independent, separately-governed silos with **two-level access** + a distance-merged, provenance-tagged result | `federated.py`, `build_silos.py` |
 | **Air-gap / offline capable** | One interface, frontier Claude API **or** a fully-local model — identical pipeline, no internet | `llm.py` |
@@ -73,6 +74,7 @@ offline and reproducible:
 | `build_silos.py` | Partition the index into independent per-silo collections (vectors copied, no re-embed). |
 | `federated_demo.py` | Same query, three principals — shows silo skipping + merged, provenance-tagged results. |
 | `agent.py` | **Agentic RAG** — Claude drives its own retrieval loop; clearance bound at the tool boundary. |
+| `mcp_server.py` | **MCP server** — exposes the access-bound retriever as tools any MCP client can call. |
 | `llm.py` | Pluggable generation: Claude API (native span citations) **or** local Ollama model. |
 | `eval_ortho.py` | Synthetic, label-free retrieval eval — Hit@k, MRR, faithfulness, paired A/B. |
 | `server.py` | FastAPI web demo: query UI, model dropdown, corpus + eval explainer pages. |
@@ -238,6 +240,43 @@ Run it as different principals and inspect the "evidence pulled" list: as
 `public`, *every* document the agent touches across all its hops is UNCLASSIFIED;
 as `director`, it can reach the classified silos. The access ceiling holds through
 the entire multi-step loop, not just the first call.
+
+## MCP server — the retriever as a reusable tool
+
+`agent.py` wires the retrieval tools into *our own* loop. `mcp_server.py` exposes
+the same tools over the **Model Context Protocol** (the open standard for
+connecting AI apps to tools), so *any* MCP client — Claude Desktop, Claude Code,
+Cursor — can call our access-controlled orthopedic retriever without a bespoke
+integration. Write the tool once; every MCP-compatible agent can use it.
+
+It advertises three tools — `search_corpus`, `federated_search`, and
+`access_context` — and runs over stdio:
+
+```bash
+RAG_MCP_USER=clinician python mcp_server.py
+```
+
+Register it with an MCP client (e.g. Claude Desktop's `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "orthopedic-rag": {
+      "command": "/abs/path/.venv/bin/python",
+      "args": ["/abs/path/mcp_server.py"],
+      "env": { "RAG_MCP_USER": "clinician" }
+    }
+  }
+}
+```
+
+**Same security boundary as the agent, one layer out:** the principal is bound at
+*server launch* via `RAG_MCP_USER` — it is **not** a tool parameter. The client's
+model only sees `search_corpus(query, k)`, so it cannot set or raise its own
+clearance; it defaults to the least-privileged `public` if unset (fail closed).
+Every tool call is audited. Same query, different bound principal → different
+authorized results (`public` gets only UNCLASSIFIED; `director` reaches the
+classified silos).
 
 ## Things worth understanding
 

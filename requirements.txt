@@ -27,3 +27,7 @@ anthropic==0.116.0
 # Web demo server (server.py): question -> retrieve -> answer, in the browser.
 fastapi==0.139.0
 uvicorn[standard]==0.50.2
+
+# Model Context Protocol SDK — exposes the retriever as an MCP server (mcp_server.py)
+# so any MCP client (Claude Desktop, Claude Code, Cursor) can call it as a tool.
+mcp==1.28.1
