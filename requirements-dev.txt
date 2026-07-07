@@ -1,0 +1,6 @@
+# Optional developer tooling — NOT needed to run the pipeline or the web server.
+# Install with:  pip install -r requirements-dev.txt
+#
+# JupyterLab + a kernel, so you can open and run rag_walkthrough.ipynb.
+jupyterlab
+ipykernel

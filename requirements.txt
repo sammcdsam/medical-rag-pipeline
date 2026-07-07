@@ -1,0 +1,29 @@
+# Minimal local RAG — runtime dependencies, pinned to a known-good combo.
+#
+# torch MUST match the GPU driver. This box has NVIDIA driver 535.x, which
+# supports up to CUDA 12.2 — so we pin the CUDA 12.1 build of torch. The
+# --extra-index-url line makes pip fetch that build from PyTorch's wheel index;
+# the "+cu121" local tag only exists there, so pip can't accidentally grab the
+# newer CUDA-13 wheel from PyPI (which fails silently to CPU on this driver).
+#
+# On a machine with a newer driver (>=550) you could instead use a cu124/cu128
+# build; on a CPU-only box, drop the extra-index-url and pin plain "torch".
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+
+# Local embeddings (BAAI/bge-small-en-v1.5) + its transformers/tokenizers stack.
+sentence-transformers==5.6.0
+transformers==5.13.0
+
+# Hugging Face dataset loading (PubMedQA).
+datasets==5.0.0
+
+# Local, on-disk vector store.
+chromadb==1.5.9
+
+# Official Claude SDK (used by query.py / eval.py / the web server).
+anthropic==0.116.0
+
+# Web demo server (server.py): question -> retrieve -> answer, in the browser.
+fastapi==0.139.0
+uvicorn[standard]==0.50.2

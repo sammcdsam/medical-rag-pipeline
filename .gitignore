@@ -1,0 +1,10 @@
+.venv/
+venv/
+chroma_db/
+__pycache__/
+*.pyc
+.env
+ortho_corpus.jsonl
+*.progress
+eval_results.json
+.claude/settings.local.json
