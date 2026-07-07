@@ -36,11 +36,13 @@ def _provenance(meta: dict) -> tuple[str, str]:
 
 
 def _access_tag(meta: dict) -> str:
-    """Human-readable access label for a chunk, if it's been labeled (see access.py)."""
-    if "classification" not in meta:
-        return ""
-    level = access.LEVEL_NAME.get(meta.get("classification"), "?")
-    return f"[{level}/{meta.get('compartment', '?')}]"
+    """Human-readable access/provenance label for a chunk, if present (see access.py / federated.py)."""
+    parts = []
+    if "classification" in meta:
+        parts.append(f"{access.LEVEL_NAME.get(meta.get('classification'), '?')}/{meta.get('compartment', '?')}")
+    if meta.get("silo"):
+        parts.append(f"silo={meta['silo']}")
+    return "[" + " ".join(parts) + "]" if parts else ""
 
 
 def retrieve(collection, question: str, k: int = config.TOP_K,
@@ -178,21 +180,35 @@ def main() -> None:
                         help="Add the cross-encoder rerank stage (retrieve a wider pool, then rerank to top-k).")
     parser.add_argument("--user", choices=tuple(access.USERS), default=None,
                         help="Retrieve AS this principal — access-control pre-filter by clearance + need-to-know.")
+    parser.add_argument("--federated", action="store_true",
+                        help="Fan the query out across access-gated silos and merge (see federated.py). Implies --user.")
     args = parser.parse_args()
 
+    import audit
     import llm  # local import avoids a circular import (llm imports query)
 
-    where = None
-    if args.user:
-        user = access.USERS[args.user]
-        where = access.build_where(user)
-        print(f"\n=== ACCESS CONTEXT ===\n{user.describe()}\nwhere-filter: {where}")
+    user = access.USERS[args.user] if args.user else None
 
-    collection = get_collection()
-    hits = retrieve(collection, args.question, k=args.k, rerank=args.rerank, where=where)
-    if args.user:
-        import audit
-        audit.record_retrieval(access.USERS[args.user], args.question, hits, where, backend=args.model)
+    if args.federated:
+        import federated
+        principal = user or access.USERS["director"]  # federation needs a principal; default fully-cleared
+        print(f"\n=== FEDERATED RETRIEVAL ({principal.name}) ===")
+        hits, report = federated.federated_retrieve(args.question, principal, k=args.k)
+        for r in report["queried"]:
+            print(f"  queried  {r['label']}: {r['returned']} hits")
+        for r in report["skipped"]:
+            print(f"  SKIPPED  {r['label']} (needs {r['min_clearance']})")
+        audit.record_retrieval(principal, args.question, hits, {"federated": True}, backend=args.model)
+    else:
+        where = None
+        if user:
+            where = access.build_where(user)
+            print(f"\n=== ACCESS CONTEXT ===\n{user.describe()}\nwhere-filter: {where}")
+        collection = get_collection()
+        hits = retrieve(collection, args.question, k=args.k, rerank=args.rerank, where=where)
+        if user:
+            audit.record_retrieval(user, args.question, hits, where, backend=args.model)
+
     result = llm.generate(args.question, hits, backend=args.model)
     print_result(result, hits)
 

@@ -33,6 +33,7 @@ from pydantic import BaseModel
 import access
 import audit
 import config
+import federated
 import llm
 from query import get_collection, retrieve, answer, _provenance
 
@@ -70,6 +71,7 @@ class Query(BaseModel):
     backend: str = "claude"   # "claude" (frontier API) or "local" (offline Ollama)
     rerank: bool = False      # add the cross-encoder stage-2 reranker
     user: str | None = None   # access-control principal (access.USERS key), or None = no filter
+    federated: bool = False   # fan out across access-gated silos and merge
 
 
 @app.get("/api/config")
@@ -112,9 +114,19 @@ def api_query(q: Query):
     # unauthorized chunks never enter the candidate set (see access.py).
     user = access.USERS.get(q.user) if q.user else None
     where = access.build_where(user) if user else None
-    hits = do_retrieve(q.question, q.k, q.rerank, where)
-    if user:
-        audit.record_retrieval(user, q.question, hits, where, backend=q.backend)
+    federation = None
+
+    if q.federated:
+        # Fan out across access-gated silos and merge (see federated.py). Federation
+        # needs a principal — default to the fully-cleared director if none picked.
+        principal = user or access.USERS["director"]
+        hits, federation = federated.federated_retrieve(q.question, principal, k=q.k)
+        audit.record_retrieval(principal, q.question, hits, {"federated": True}, backend=q.backend)
+        user = principal
+    else:
+        hits = do_retrieve(q.question, q.k, q.rerank, where)
+        if user:
+            audit.record_retrieval(user, q.question, hits, where, backend=q.backend)
 
     chunks = []
     for i, (t, m, d) in enumerate(hits):
@@ -126,6 +138,7 @@ def api_query(q: Query):
             "distance": round(float(d), 3),
             "classification": access.LEVEL_NAME.get(m.get("classification")) if "classification" in m else None,
             "compartment": m.get("compartment"),
+            "silo": federated.SILOS[m["silo"]]["label"] if m.get("silo") else None,
             "text": t,
         })
     result = {
@@ -133,6 +146,7 @@ def api_query(q: Query):
         "answered": False, "answer": None, "citations": [],
         "backend": q.backend, "model": None, "reranked": q.rerank,
         "access": {"user": user.name, "clearance": user.clearance_name, "where": where} if user else None,
+        "federation": federation,
     }
 
     # Route to the chosen backend. Claude needs a key; local needs none (offline).
@@ -325,6 +339,8 @@ HTML = """<!doctype html>
     <div class="kbox">top-k <input type="number" id="k" min="1" max="20" value="5"></div>
     <label class="kbox" title="Two-stage retrieval: pull a wider candidate pool, then re-rank with a cross-encoder">
       <input type="checkbox" id="rerank"> rerank</label>
+    <label class="kbox" title="Federated: fan the query across access-gated silos and merge the results">
+      <input type="checkbox" id="federated"> federated</label>
     <button id="go" type="submit">Ask</button>
   </form>
   <div class="access-line" id="accessLine"></div>
@@ -334,6 +350,11 @@ HTML = """<!doctype html>
     <h2 id="answerHead">Answer</h2>
     <div class="answer" id="answer"></div>
     <div id="cites"></div>
+  </div>
+
+  <div class="card hidden" id="fedCard">
+    <h2>Federated across silos</h2>
+    <div id="fed"></div>
   </div>
 
   <div class="card hidden" id="chunkCard">
@@ -397,7 +418,7 @@ $('f').addEventListener('submit', async e => {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ question, k: Number($('k').value),
                              backend: $('backend').value, rerank: $('rerank').checked,
-                             user: $('role').value || null })
+                             user: $('role').value || null, federated: $('federated').checked })
     });
     const data = await res.json();
     render(data);
@@ -417,6 +438,18 @@ function render(data) {
   $('cites').innerHTML = (data.citations || [])
     .map(c => `<div class="cite">${escapeHtml(c.title)}: "${escapeHtml(c.text)}"</div>`).join('');
 
+  // Federation report (which silos were queried vs skipped at the silo level)
+  if (data.federation) {
+    $('fedCard').classList.remove('hidden');
+    const q = data.federation.queried.map(r =>
+      `<span class="chip" style="border-color:#1c5236;color:#4cc38a">✓ ${escapeHtml(r.label)} · ${r.returned} hits</span>`).join('');
+    const s = data.federation.skipped.map(r =>
+      `<span class="chip" style="opacity:.65">✕ ${escapeHtml(r.label)} · needs ${r.min_clearance}</span>`).join('');
+    $('fed').innerHTML = `<div class="chips">${q}${s}</div>`;
+  } else {
+    $('fedCard').classList.add('hidden');
+  }
+
   // Chunks (similarity bar = 1 - cosine distance)
   $('chunkCard').classList.remove('hidden');
   let head = data.reranked
@@ -429,11 +462,12 @@ function render(data) {
     const cls = ch.classification
       ? `<span class="clsbadge cls-${ch.classification}">${ch.classification}</span>` : '';
     const comp = ch.compartment ? `<span>${escapeHtml(ch.compartment)}</span>` : '';
+    const silo = ch.silo ? `<span title="source silo">⛁ ${escapeHtml(ch.silo)}</span>` : '';
     return `<div class="chunk">
       <div class="meta">
         <span>#${ch.rank}</span>
         <span>${escapeHtml(ch.source)}</span>
-        ${cls}${comp}
+        ${cls}${comp}${silo}
         <span>dist ${ch.distance.toFixed(3)}</span>
         <span class="simbar"><span style="width:${(sim*100).toFixed(0)}%"></span></span>
       </div>

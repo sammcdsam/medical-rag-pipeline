@@ -49,6 +49,9 @@ offline and reproducible:
 | `label_access.py` | One-time migration: stamp (synthetic) `classification` + `compartment` onto every chunk. |
 | `access_demo.py` | Runs one query as three principals — shows correctly-scoped retrieval + leak prevention. |
 | `audit.py` | Append-only JSONL log: who retrieved what, when, under which access filter. |
+| `federated.py` | Federated retrieval across access-gated silos — silo-level authz, fan-out, merge. |
+| `build_silos.py` | Partition the index into independent per-silo collections (vectors copied, no re-embed). |
+| `federated_demo.py` | Same query, three principals — shows silo skipping + merged, provenance-tagged results. |
 | `llm.py` | Pluggable generation: Claude API (native span citations) **or** local Ollama model. |
 | `eval_ortho.py` | Synthetic, label-free retrieval eval — Hit@k, MRR, faithfulness, paired A/B. |
 | `server.py` | FastAPI web demo: query UI, model dropdown, corpus + eval explainer pages. |
@@ -147,6 +150,46 @@ outcome: the **clinician** (SECRET clearance but no oncology need-to-know) gets
 **zero** oncology documents, while the **director** retrieves `SECRET`- and
 `TOP_SECRET`-classified papers that the others provably cannot. Every retrieval
 is written to `audit_log.jsonl` (who saw what, when, under which filter).
+
+## Federated retrieval across silos
+
+Real secure-sharing systems don't hold one index — they discover across many
+independent, separately-governed sources. `build_silos.py` partitions the corpus
+into **N independent Chroma collections** (genuinely separate indexes, as if each
+lived at a different org), each with its own **minimum clearance to query it**:
+
+| Silo | Min clearance to query |
+|---|---|
+| Mercy General Hospital | UNCLASSIFIED |
+| University Biomech Lab | UNCLASSIFIED |
+| Veterans Health Network | CONFIDENTIAL |
+| DoD Orthopedic Research | SECRET |
+
+`federated.federated_retrieve(question, user)` then does the distributed-retrieval
+dance — **two levels of access**:
+
+1. **Silo-level authorization** — skip silos the user isn't cleared to query at all
+   (an UNCLASSIFIED user's query never even touches the SECRET silo).
+2. **Document-level pre-filter** — within each queried silo, the same
+   clearance/need-to-know `where` filter still gates individual chunks.
+3. **Merge** — the per-silo ranked lists are merged by cosine distance into one
+   result, each hit tagged with its **source silo** for provenance.
+
+```bash
+python build_silos.py       # once: partition into per-silo collections
+python federated_demo.py    # same query as public / clinician / director
+python query.py "..." --user public --federated
+```
+
+Run `federated_demo.py`: **public** (UNCLASSIFIED) can only query 2 of the 4
+silos — the CONFIDENTIAL and SECRET silos are skipped at the silo level — while
+**director** fans out across all four and the merged result pulls a `SECRET` paper
+from the DoD silo that no one else can reach.
+
+> **Merge caveat (worth naming):** every silo here shares one embedder, so cosine
+> distances are directly comparable and a distance-sort merge is valid. A real
+> heterogeneous federation (a different embedder per silo) would need score
+> normalisation or a cross-encoder rerank to merge fairly.
 
 ## Things worth understanding
 
