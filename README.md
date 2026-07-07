@@ -71,7 +71,7 @@ python query.py "What are the risk factors for infection after a knee replacemen
 python query.py "..." --model local      # $0, no internet — the air-gap path
 
 # 3. Evaluate the retriever (no gold labels needed — see below).
-python eval_ortho.py --n 60 --hard --compare --faithfulness
+python eval_ortho.py --n 60 --hard --compare --relevance --faithfulness
 
 # 4. Web demo.
 python server.py                   # http://localhost:8022
@@ -85,7 +85,7 @@ against the whole corpus → check whether the source abstract's PMID comes back
 (Hit@k, MRR). `--faithfulness` additionally runs the full RAG answer and has an
 LLM judge score how well-grounded it is.
 
-Two design choices make this more than a vanity metric:
+Three design choices make this more than a vanity metric:
 
 - **`--hard` mode** generates *paraphrased* questions that strip the abstract's
   exact device names, cohort sizes, and numbers — removing the verbatim-overlap
@@ -93,14 +93,22 @@ Two design choices make this more than a vanity metric:
 - **`--compare` runs a *paired* A/B** — the same questions retrieved with and
   without the reranker — so any difference is the reranker's true effect, not
   question-sampling noise.
+- **`--relevance` grades *every* retrieved chunk** (LLM-judge, 0/1/2) → Precision@k
+  and **nDCG@k**, a multi-relevant metric — because on a paraphrased question many
+  abstracts are relevant, not just the source PMID.
 
-The interesting finding: on hard questions the reranker is **neutral on
-source-recall** (Hit@5 ≈ unchanged) but **improves answer grounding**
-(faithfulness ~88% → ~90%). Why? On a dense corpus where *many* abstracts answer
-a paraphrased question, "did the one source PMID come back" is the wrong metric
-for a reranker — it reshuffles *among* relevant docs, which shows up in answer
-quality, not single-source recall. Catching that is the whole point of building
-the eval before trusting the feature.
+The honest finding (paired, n=60, hard questions): the cross-encoder reranker
+does **not** beat the bge-small bi-encoder on this corpus. Across every metric
+family it's roughly neutral, and marginally *negative* on most — Hit@5 65→68,
+MRR 0.57→0.51, Precision@5 75→73, nDCG@5 0.89→0.86, faithfulness 89→89. The
+bi-encoder already reaches nDCG@5 ≈ 0.89, so there's little headroom, and a
+general-purpose reranker adds noise on short, self-contained abstracts.
+
+**The value here isn't the reranker — it's the eval rigorous enough to prove the
+reranker isn't worth shipping on this corpus.** (An earlier n=8 spot-check looked
+like a big nDCG win; it was small-sample noise, which is exactly why the real run
+is n=60 with a paired design. Knowing when *not* to add a component is as much
+the job as adding one.)
 
 ## Things worth understanding
 

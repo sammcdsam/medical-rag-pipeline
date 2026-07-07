@@ -451,11 +451,11 @@ EVAL_HTML = """<!doctype html>
           <td>MRR</td><td class="s-yes">✅</td>
           <td>Rewards putting the on-topic paper at rank 0.</td></tr>
       <tr><td>How many of k are relevant?</td><td>Padding top-k with off-topic hits</td>
-          <td>Precision@k</td><td class="s-plan">○</td>
-          <td>Needs multi-relevant labels (a clinician tags them).</td></tr>
+          <td>Precision@k</td><td class="s-yes">✅</td>
+          <td>LLM-judge grades each chunk 0/1/2 (<code>--relevance</code>) — no human labels needed.</td></tr>
       <tr><td>Graded ranking quality</td><td>Slightly-relevant ranked over highly-relevant</td>
-          <td>nDCG@k, MAP</td><td class="s-plan">○</td>
-          <td>Useful once we have graded relevance judgements.</td></tr>
+          <td>nDCG@k</td><td class="s-yes">✅</td>
+          <td>Same graded judgements; the metric where the reranker's reordering finally shows.</td></tr>
       <tr class="catrow"><td colspan="5">Answer quality — LLM in the loop</td></tr>
       <tr><td>Is the answer grounded in the context?</td><td><b>Hallucination</b> — confident claims not in the sources</td>
           <td>Faithfulness / groundedness</td><td class="s-yes">✅</td>
@@ -584,23 +584,35 @@ fetch('/api/eval').then(r => r.json()).then(d => {
   // Paired A/B (--compare): same questions retrieved with vs without the reranker.
   if (d.compare) {
     const off = d.compare.off, on = d.compare.on;
-    let rows =
-      `<tr><td>Hit@${d.k}</td><td>${pct(off.hit_at_k)}</td><td>${pct(on.hit_at_k)}</td></tr>` +
-      `<tr><td>MRR</td><td>${off.mrr.toFixed(3)}</td><td>${on.mrr.toFixed(3)}</td></tr>`;
+    const grp = (lab) => `<tr class="catrow"><td colspan="3">${lab}</td></tr>`;
+    let rows = grp('Single-source retrieval (is the source PMID in top-k?)')
+      + `<tr><td>Hit@${d.k}</td><td>${pct(off.hit_at_k)}</td><td>${pct(on.hit_at_k)}</td></tr>`
+      + `<tr><td>MRR</td><td>${off.mrr.toFixed(3)}</td><td>${on.mrr.toFixed(3)}</td></tr>`;
+    if (off.ndcg_at_k != null)
+      rows += grp('Multi-relevant retrieval (every chunk graded 0/1/2)')
+        + `<tr><td>Precision@${d.k}</td><td>${pct(off.precision_at_k)}</td><td>${pct(on.precision_at_k)}</td></tr>`
+        + `<tr><td>nDCG@${d.k}</td><td>${off.ndcg_at_k.toFixed(3)}</td><td>${on.ndcg_at_k.toFixed(3)}</td></tr>`;
     if (off.faithfulness != null)
-      rows += `<tr><td>Faithfulness</td><td>${off.faithfulness.toFixed(1)}%</td><td>${on.faithfulness.toFixed(1)}%</td></tr>`;
+      rows += grp('Answer quality')
+        + `<tr><td>Faithfulness</td><td>${off.faithfulness.toFixed(1)}%</td><td>${on.faithfulness.toFixed(1)}%</td></tr>`;
+
+    const notes = [];
+    if (off.ndcg_at_k != null)
+      notes.push(`<b>Reading Precision@${d.k} vs nDCG@${d.k}.</b> Precision counts how many of the top-${d.k} are `
+        + `relevant; nDCG additionally rewards ranking the <i>most</i> relevant <i>first</i>. Compared together they `
+        + `separate a change that retrieved a better <i>set</i> from one that merely reordered it — the axis single-source `
+        + `Hit@k is blind to.`);
+    notes.push(`Because this is a <b>paired</b> A/B (identical questions both ways), even small deltas are real signal, not `
+      + `question-sampling noise — which also means it can show when a component like the reranker <b>doesn't</b> beat a `
+      + `strong bi-encoder on this corpus. Knowing that is the point of measuring before shipping.`);
+
     el.innerHTML =
       `<p style="margin-top:0">Paired A/B — the <b>same</b> questions retrieved with and without the `
       + `stage-2 cross-encoder reranker, so any gap is the reranker's true effect, not question-sampling noise.</p>`
       + `<div class="tablewrap"><table style="min-width:auto">`
       + `<thead><tr><th>metric</th><th>rerank OFF</th><th>rerank ON</th></tr></thead>`
       + `<tbody>${rows}</tbody></table></div>`
-      + (off.faithfulness != null
-          ? `<p class="note" style="margin-top:14px">Typical result on hard questions: the reranker is roughly `
-            + `<b>neutral on source-recall</b> (Hit@k/MRR) but <b>lifts faithfulness</b>. On a dense corpus where many `
-            + `abstracts answer a paraphrased question, single-source Hit@k is the wrong lens for a reranker — it `
-            + `reshuffles <i>among</i> relevant docs, which shows up in answer grounding, not source recall.</p>`
-          : '')
+      + notes.map(n => `<p class="note" style="margin-top:14px">${n}</p>`).join('')
       + stamp;
     return;
   }
@@ -608,6 +620,8 @@ fetch('/api/eval').then(r => r.json()).then(d => {
   // Single-config run.
   const m = (v, l) => `<div class="metric"><div class="v">${v}</div><div class="l">${l}</div></div>`;
   let cards = m(pct(d.hit_at_k), `Hit@${d.k}`) + m(d.mrr.toFixed(3), 'MRR');
+  if (d.ndcg_at_k !== null && d.ndcg_at_k !== undefined)
+    cards += m(pct(d.precision_at_k), `Precision@${d.k}`) + m(d.ndcg_at_k.toFixed(3), `nDCG@${d.k}`);
   if (d.faithfulness !== null && d.faithfulness !== undefined)
     cards += m(d.faithfulness.toFixed(0) + '%', 'Faithfulness');
   cards += m(d.rerank ? 'on' : 'off', 'reranker') + m(d.n, 'questions');
