@@ -4,3 +4,6 @@
 # JupyterLab + a kernel, so you can open and run rag_walkthrough.ipynb.
 jupyterlab
 ipykernel
+
+# Test runner for the tests/ suite (unit + security-invariant integration tests).
+pytest

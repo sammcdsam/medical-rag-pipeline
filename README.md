@@ -77,7 +77,8 @@ offline and reproducible:
 | `mcp_server.py` | **MCP server** — exposes the access-bound retriever as tools any MCP client can call. |
 | `llm.py` | Pluggable generation: Claude API (native span citations) **or** local Ollama model. |
 | `eval_ortho.py` | Synthetic, label-free retrieval eval — Hit@k, MRR, faithfulness, paired A/B. |
-| `server.py` | FastAPI web demo: query UI, model dropdown, corpus + eval explainer pages. |
+| `server.py` | FastAPI web demo: query UI (model / rerank / role / federated), live agent runner, and `/agent` `/security` `/corpus` `/eval` explainer pages. |
+| `tests/` | pytest suite — access/federated/eval unit tests + security-invariant integration tests. |
 | `ingest.py` / `eval.py` | The original PubMedQA baseline (kept for reference). |
 
 ## Setup
@@ -100,12 +101,43 @@ python ingest_pubmed.py            # chunk → embed (local GPU) → Chroma
 python query.py "What are the risk factors for infection after a knee replacement?" --rerank
 python query.py "..." --model local      # $0, no internet — the air-gap path
 
-# 3. Evaluate the retriever (no gold labels needed — see below).
+# 3. (Optional) enable the security features on the index.
+python label_access.py             # stamp synthetic classification + compartment
+python build_silos.py              # partition into independent per-silo collections
+
+# 4. Ask a question — as a plain pipeline, a specific principal, or an agent.
+python query.py "..." --user clinician             # access-controlled retrieval
+python query.py "..." --user public --federated    # federated across silos
+python agent.py "Compare infection risk after knee vs spinal fusion" --user director
+
+# 5. Evaluate the retriever (no gold labels needed — see below).
 python eval_ortho.py --n 60 --hard --compare --relevance --faithfulness
 
-# 4. Web demo.
-python server.py                   # http://localhost:8022
+# 6. Web demo (query UI + agent runner + explainer pages), and the MCP server.
+python server.py                                   # http://localhost:8022
+RAG_MCP_USER=clinician python mcp_server.py        # expose the retriever over MCP
 ```
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest                             # 23 tests, ~7s
+```
+
+The suite is unit tests for the access / federated / eval logic plus
+**security-invariant** checks — the ones worth reading:
+
+- **The pre-filter actually blocks** (integration, against the real index): a
+  `public` retrieval returns *only* UNCLASSIFIED docs; a `clinician` never gets an
+  oncology or above-clearance doc; a `public` federated query skips the classified
+  silos entirely. (These skip automatically if the corpus/silos aren't built.)
+- **The model can't set its own access**: the agent and MCP tool schemas expose
+  *only* `query` + `k` — no `user`/`clearance`/`classification` — and the MCP
+  server fails closed to the least-privileged `public` when no principal is set.
+- **nDCG sees ordering, Precision doesn't**: the same relevant set in a worse order
+  scores identical Precision@k but lower nDCG@k — the property behind the reranker
+  A/B.
 
 ## Evaluation — and an honest result
 
