@@ -13,6 +13,7 @@ import argparse
 import chromadb
 from anthropic import Anthropic
 
+import access
 import config
 from embedder import embed_query
 
@@ -34,8 +35,17 @@ def _provenance(meta: dict) -> tuple[str, str]:
     return "pubid", str(meta.get("pubid", "?"))
 
 
+def _access_tag(meta: dict) -> str:
+    """Human-readable access label for a chunk, if it's been labeled (see access.py)."""
+    if "classification" not in meta:
+        return ""
+    level = access.LEVEL_NAME.get(meta.get("classification"), "?")
+    return f"[{level}/{meta.get('compartment', '?')}]"
+
+
 def retrieve(collection, question: str, k: int = config.TOP_K,
-             rerank: bool = False, candidates: int = config.RERANK_CANDIDATES):
+             rerank: bool = False, candidates: int = config.RERANK_CANDIDATES,
+             where: dict | None = None):
     """Return a list of (chunk_text, metadata, distance), best first.
 
     With rerank=False this is a plain bi-encoder search for the top-k.
@@ -43,12 +53,18 @@ def retrieve(collection, question: str, k: int = config.TOP_K,
     then let the cross-encoder narrow it to the final k — see reranker.py. The
     single entry point means the CLI, server, and eval all get reranking for
     free by passing one flag.
+
+    `where` is an access-control PRE-FILTER (see access.py): the vector store
+    applies it DURING search, so chunks the user isn't authorized for never
+    enter the candidate set — they can't leak into the context, citations, or
+    answer, and the reranker never sees them either.
     """
     n = candidates if rerank else k
     q_emb = embed_query(question)
     res = collection.query(
         query_embeddings=[q_emb],
         n_results=n,
+        where=where,
         include=["documents", "metadatas", "distances"],
     )
     # Chroma returns a list-per-query; we only sent one query, so unwrap [0].
@@ -136,8 +152,9 @@ def print_result(result: dict, hits) -> None:
     print("\n=== RETRIEVED CHUNKS ===")
     for i, (text, meta, dist) in enumerate(hits):
         kind, ident = _provenance(meta)
-        preview = text[:120].replace("\n", " ")
-        print(f"[{i}] {kind}={ident}  cos_dist={dist:.3f}  {preview}...")
+        preview = text[:100].replace("\n", " ")
+        tag = _access_tag(meta)
+        print(f"[{i}] {kind}={ident}  cos_dist={dist:.3f}  {tag}  {preview}...")
 
     print(f"\n=== ANSWER ({result['backend']} · {result['model']}) ===")
     print(result["answer"])
@@ -159,12 +176,23 @@ def main() -> None:
                         help="Generation backend: Claude API (native citations) or local Ollama model.")
     parser.add_argument("--rerank", action="store_true",
                         help="Add the cross-encoder rerank stage (retrieve a wider pool, then rerank to top-k).")
+    parser.add_argument("--user", choices=tuple(access.USERS), default=None,
+                        help="Retrieve AS this principal — access-control pre-filter by clearance + need-to-know.")
     args = parser.parse_args()
 
     import llm  # local import avoids a circular import (llm imports query)
 
+    where = None
+    if args.user:
+        user = access.USERS[args.user]
+        where = access.build_where(user)
+        print(f"\n=== ACCESS CONTEXT ===\n{user.describe()}\nwhere-filter: {where}")
+
     collection = get_collection()
-    hits = retrieve(collection, args.question, k=args.k, rerank=args.rerank)
+    hits = retrieve(collection, args.question, k=args.k, rerank=args.rerank, where=where)
+    if args.user:
+        import audit
+        audit.record_retrieval(access.USERS[args.user], args.question, hits, where, backend=args.model)
     result = llm.generate(args.question, hits, backend=args.model)
     print_result(result, hits)
 

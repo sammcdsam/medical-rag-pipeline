@@ -44,7 +44,11 @@ offline and reproducible:
 | `reranker.py` | **Stage 2.** Cross-encoder (`BAAI/bge-reranker-base`) reranks the candidate pool. |
 | `pubmed.py` / `download_corpus.py` | Fetch orthopedic abstracts from NCBI Entrez → cache to JSONL. |
 | `ingest_pubmed.py` | Chunk → embed locally (GPU) → store in Chroma. Reads the local cache offline. |
-| `query.py` | Question → retrieve (± rerank) → generate with citations → print answer + sources. |
+| `query.py` | Question → retrieve (± rerank, ± access filter) → generate with citations → print answer + sources. |
+| `access.py` | Access-control model — clearance + need-to-know compartments; builds the retrieval pre-filter. |
+| `label_access.py` | One-time migration: stamp (synthetic) `classification` + `compartment` onto every chunk. |
+| `access_demo.py` | Runs one query as three principals — shows correctly-scoped retrieval + leak prevention. |
+| `audit.py` | Append-only JSONL log: who retrieved what, when, under which access filter. |
 | `llm.py` | Pluggable generation: Claude API (native span citations) **or** local Ollama model. |
 | `eval_ortho.py` | Synthetic, label-free retrieval eval — Hit@k, MRR, faithfulness, paired A/B. |
 | `server.py` | FastAPI web demo: query UI, model dropdown, corpus + eval explainer pages. |
@@ -109,6 +113,40 @@ reranker isn't worth shipping on this corpus.** (An earlier n=8 spot-check looke
 like a big nDCG win; it was small-sample noise, which is exactly why the real run
 is n=60 with a paired design. Knowing when *not* to add a component is as much
 the job as adding one.)
+
+## Access-controlled retrieval
+
+Retrieval can be gated by *who is asking* — the core of any secure data-sharing
+system. Two orthogonal axes (the classic Bell–LaPadula shape):
+
+- **Clearance** (hierarchical): `UNCLASSIFIED < CONFIDENTIAL < SECRET < TOP_SECRET`.
+  You see a doc only if its `classification ≤ your clearance`.
+- **Compartments** (need-to-know, non-hierarchical): the orthopedic subtopics act
+  as compartments. Even with high clearance, no need-to-know for a topic means no
+  access to it.
+
+The labels are **synthetic** (PubMed is public): `classification` is a stable
+hash of the PMID, `compartment` is the abstract's real subtopic — a stand-in so
+the mechanism is demonstrable. `label_access.py` stamps them onto the index once.
+
+The key property is that enforcement is a **pre-filter**: `access.build_where(user)`
+becomes a vector-store `where` predicate applied *during* the search, so
+unauthorized chunks never enter the candidate set — they can't leak into the
+retrieved context, the citations, or the generated answer, and the reranker never
+sees them either. (Post-filtering *after* retrieval is both a leak risk — the
+model already read the text — and silently shrinks k.)
+
+```bash
+python label_access.py     # once: stamp synthetic classification + compartment
+python access_demo.py      # same query as public / clinician / director
+python query.py "..." --user clinician    # retrieve as a specific principal
+```
+
+`access_demo.py` runs one oncology query as three principals and shows the
+outcome: the **clinician** (SECRET clearance but no oncology need-to-know) gets
+**zero** oncology documents, while the **director** retrieves `SECRET`- and
+`TOP_SECRET`-classified papers that the others provably cannot. Every retrieval
+is written to `audit_log.jsonl` (who saw what, when, under which filter).
 
 ## Things worth understanding
 
