@@ -29,6 +29,7 @@ capability is a small, readable module, not a framework call:
 
 | Capability | What it shows | Where |
 |---|---|---|
+| **Agentic retrieval** | Claude drives its own multi-hop retrieval loop; the user's clearance is bound at the **tool boundary**, so the model can't escalate — even under prompt injection | `agent.py` |
 | **Access-controlled retrieval** | Clearance + need-to-know enforced as a vector-store **pre-filter** — unauthorized docs never reach the model | `access.py`, `query.py` |
 | **Federated multi-silo retrieval** | Fan-out across independent, separately-governed silos with **two-level access** + a distance-merged, provenance-tagged result | `federated.py`, `build_silos.py` |
 | **Air-gap / offline capable** | One interface, frontier Claude API **or** a fully-local model — identical pipeline, no internet | `llm.py` |
@@ -71,6 +72,7 @@ offline and reproducible:
 | `federated.py` | Federated retrieval across access-gated silos — silo-level authz, fan-out, merge. |
 | `build_silos.py` | Partition the index into independent per-silo collections (vectors copied, no re-embed). |
 | `federated_demo.py` | Same query, three principals — shows silo skipping + merged, provenance-tagged results. |
+| `agent.py` | **Agentic RAG** — Claude drives its own retrieval loop; clearance bound at the tool boundary. |
 | `llm.py` | Pluggable generation: Claude API (native span citations) **or** local Ollama model. |
 | `eval_ortho.py` | Synthetic, label-free retrieval eval — Hit@k, MRR, faithfulness, paired A/B. |
 | `server.py` | FastAPI web demo: query UI, model dropdown, corpus + eval explainer pages. |
@@ -209,6 +211,33 @@ from the DoD silo that no one else can reach.
 > distances are directly comparable and a distance-sort merge is valid. A real
 > heterogeneous federation (a different embedder per silo) would need score
 > normalisation or a cross-encoder rerank to merge fairly.
+
+## Agentic retrieval
+
+`query.py` runs a fixed pipeline (embed → retrieve → answer, once). `agent.py`
+hands Claude the retriever as **tools** and lets it drive its own loop — search,
+read the results, refine the query or search a different sub-topic, then answer.
+That unlocks what a single-shot pipeline can't: **multi-hop** questions ("compare
+infection risk after knee replacement vs spinal fusion" → it searches each, then
+compares), query reformulation, and honest abstention.
+
+The security-critical design: **the user's clearance is bound in the harness, not
+exposed as a tool parameter.** Claude only ever sees `search(query, k)`; every
+call is executed as `retrieve(query, user=<the bound principal>)` with the access
+pre-filter applied. So the model **cannot escalate its own privileges** — even a
+prompt-injection hidden in a retrieved document can't change the access level,
+because the boundary lives in the code, not in the model's reasoning. Every tool
+call is written to the audit log.
+
+```bash
+python agent.py "Compare infection risk after knee replacement vs spinal fusion" --user clinician
+python agent.py "..." --user director
+```
+
+Run it as different principals and inspect the "evidence pulled" list: as
+`public`, *every* document the agent touches across all its hops is UNCLASSIFIED;
+as `director`, it can reach the classified silos. The access ceiling holds through
+the entire multi-step loop, not just the first call.
 
 ## Things worth understanding
 
