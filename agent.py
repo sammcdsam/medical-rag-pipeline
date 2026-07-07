@@ -114,12 +114,25 @@ def _run_tool(name: str, tool_input: dict, user, collection):
     return _format_hits(hits), hits
 
 
+def _level_mix(hits) -> dict:
+    """Count of classification levels among a set of hits — for the trace summary."""
+    mix = {}
+    for _t, m, _d in hits:
+        lvl = access.LEVEL_NAME.get(m.get("classification"), "?") if "classification" in m else "-"
+        mix[lvl] = mix.get(lvl, 0) + 1
+    return mix
+
+
 def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 6, verbose: bool = True):
-    """Drive the agentic loop until Claude answers or we hit max_steps."""
+    """Drive the agentic loop until Claude answers or we hit max_steps.
+
+    Returns {answer, hits, steps, trace}. `trace` is a structured list of what the
+    agent did (its narration and each tool call), so a UI can render the loop.
+    """
     client = Anthropic()
     collection = get_collection(config.COLLECTION_ORTHO)
     messages = [{"role": "user", "content": question}]
-    all_hits = []
+    all_hits, trace = [], []
 
     for step in range(1, max_steps + 1):
         resp = client.messages.create(
@@ -127,10 +140,10 @@ def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 
             system=SYSTEM, tools=TOOLS, messages=messages,
         )
 
-        # Show any narration the model wrote alongside its tool calls.
-        if verbose:
-            for block in resp.content:
-                if block.type == "text" and block.text.strip():
+        for block in resp.content:
+            if block.type == "text" and block.text.strip():
+                trace.append({"type": "thought", "step": step, "text": block.text.strip()})
+                if verbose:
                     print(f"  · {block.text.strip()}")
 
         if resp.stop_reason in ("tool_use", "pause_turn"):
@@ -143,6 +156,9 @@ def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 
                     print(f"  → {block.name}({block.input.get('query', '')!r})")
                 text, hits = _run_tool(block.name, block.input, user, collection)
                 all_hits.extend(hits)
+                trace.append({"type": "tool", "step": step, "name": block.name,
+                              "query": block.input.get("query", ""),
+                              "returned": len(hits), "levels": _level_mix(hits)})
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": text})
             if results:
                 messages.append({"role": "user", "content": results})
@@ -150,10 +166,10 @@ def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 
 
         # end_turn — the agent is done.
         answer = "".join(b.text for b in resp.content if b.type == "text")
-        return {"answer": answer, "hits": all_hits, "steps": step}
+        return {"answer": answer, "hits": all_hits, "steps": step, "trace": trace}
 
     return {"answer": "(stopped: reached max_steps without a final answer)",
-            "hits": all_hits, "steps": max_steps}
+            "hits": all_hits, "steps": max_steps, "trace": trace}
 
 
 def main() -> None:
