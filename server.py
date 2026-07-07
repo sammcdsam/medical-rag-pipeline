@@ -50,15 +50,15 @@ def collection():
     return _collection
 
 
-def do_retrieve(question: str, k: int):
+def do_retrieve(question: str, k: int, rerank: bool = False):
     """Retrieve, re-opening the collection if the cached handle went stale
     (e.g. the corpus was rebuilt while this server was running)."""
     global _collection
     try:
-        return retrieve(collection(), question, k)
+        return retrieve(collection(), question, k, rerank=rerank)
     except Exception:
         _collection = None
-        return retrieve(collection(), question, k)
+        return retrieve(collection(), question, k, rerank=rerank)
 
 
 # --- API -------------------------------------------------------------------
@@ -66,6 +66,7 @@ class Query(BaseModel):
     question: str
     k: int = config.TOP_K
     backend: str = "claude"   # "claude" (frontier API) or "local" (offline Ollama)
+    rerank: bool = False      # add the cross-encoder stage-2 reranker
 
 
 @app.get("/api/config")
@@ -76,6 +77,8 @@ def api_config():
         "embedder": config.EMBED_MODEL,
         "llm": config.CLAUDE_MODEL,
         "local_model": config.LOCAL_MODEL,
+        "reranker": config.RERANK_MODEL,
+        "rerank_candidates": config.RERANK_CANDIDATES,
         "top_k": config.TOP_K,
         "collection": config.COLLECTION_NAME,
         "has_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
@@ -84,8 +87,8 @@ def api_config():
 
 @app.post("/api/query")
 def api_query(q: Query):
-    """question -> retrieve top-k -> (optionally) Claude answer + citations."""
-    hits = do_retrieve(q.question, q.k)
+    """question -> retrieve top-k (optionally reranked) -> (optionally) Claude answer + citations."""
+    hits = do_retrieve(q.question, q.k, q.rerank)
 
     chunks = []
     for i, (t, m, d) in enumerate(hits):
@@ -100,7 +103,7 @@ def api_query(q: Query):
     result = {
         "question": q.question, "chunks": chunks,
         "answered": False, "answer": None, "citations": [],
-        "backend": q.backend, "model": None,
+        "backend": q.backend, "model": None, "reranked": q.rerank,
     }
 
     # Route to the chosen backend. Claude needs a key; local needs none (offline).
@@ -278,6 +281,8 @@ HTML = """<!doctype html>
         <option value="local">Local (offline)</option>
       </select></div>
     <div class="kbox">top-k <input type="number" id="k" min="1" max="20" value="5"></div>
+    <label class="kbox" title="Two-stage retrieval: pull a wider candidate pool, then re-rank with a cross-encoder">
+      <input type="checkbox" id="rerank"> rerank</label>
     <button id="go" type="submit">Ask</button>
   </form>
 
@@ -288,7 +293,7 @@ HTML = """<!doctype html>
   </div>
 
   <div class="card hidden" id="chunkCard">
-    <h2>Retrieved chunks (lower distance = closer)</h2>
+    <h2 id="chunkHead">Retrieved chunks (lower distance = closer)</h2>
     <div id="chunks"></div>
   </div>
 </main>
@@ -300,6 +305,7 @@ const $ = id => document.getElementById(id);
 fetch('/api/config').then(r => r.json()).then(c => {
   $('badges').innerHTML =
     `<span class="badge">embedder <b>${c.embedder}</b></span>` +
+    `<span class="badge">reranker <b>${c.reranker}</b></span>` +
     `<span class="badge">Claude <b>${c.llm}</b></span>` +
     `<span class="badge">local <b>${c.local_model}</b></span>` +
     `<span class="badge">top-k <b>${c.top_k}</b></span>` +
@@ -315,7 +321,8 @@ $('f').addEventListener('submit', async e => {
   try {
     const res = await fetch('/api/query', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ question, k: Number($('k').value), backend: $('backend').value })
+      body: JSON.stringify({ question, k: Number($('k').value),
+                             backend: $('backend').value, rerank: $('rerank').checked })
     });
     const data = await res.json();
     render(data);
@@ -337,6 +344,9 @@ function render(data) {
 
   // Chunks (similarity bar = 1 - cosine distance)
   $('chunkCard').classList.remove('hidden');
+  $('chunkHead').textContent = data.reranked
+    ? 'Retrieved chunks — reordered by cross-encoder (distance no longer monotonic)'
+    : 'Retrieved chunks (lower distance = closer)';
   $('chunks').innerHTML = data.chunks.map(ch => {
     const sim = Math.max(0, 1 - ch.distance);
     return `<div class="chunk">
@@ -485,13 +495,24 @@ EVAL_HTML = """<!doctype html>
     judge what fraction is supported by the retrieved context (LLM-as-judge groundedness).</p>
   </div>
   <p style="margin-top:14px">Run it:</p>
-  <pre>python eval_ortho.py --n 40                 # retrieval eval
-python eval_ortho.py --n 20 --faithfulness  # + groundedness</pre>
+  <pre>python eval_ortho.py --n 40                              # easy retrieval eval
+python eval_ortho.py --n 60 --hard                      # paraphrased (harder) questions
+python eval_ortho.py --n 60 --hard --compare            # paired A/B: rerank off vs on
+python eval_ortho.py --n 40 --hard --compare --faithfulness   # + answer grounding</pre>
 
   <p class="note"><b>Honest caveat.</b> A generated question may be answerable by <i>other</i>
   abstracts too, so checking only the source PMID slightly under-counts a genuinely good
   retriever — treat Hit@k here as a <b>lower bound</b>, not ground truth. Fixing this properly
   means graded relevance judgements, which is where a clinician-in-the-loop comes in.</p>
+
+  <h2>Two-stage retrieval &amp; the reranker A/B</h2>
+  <p>Retrieval runs in two stages: the <b>bi-encoder</b> (bge-small) scores query and chunk
+  independently — fast enough to search all 34k chunks — then an optional <b>cross-encoder
+  reranker</b> (bge-reranker-base) reads each <code>(question, chunk)</code> pair together and
+  re-ranks the top candidates. <code>--hard</code> makes the questions paraphrase away the
+  abstract's exact terms (a stiffer test); <code>--compare</code> evaluates the <b>same</b>
+  questions with and without the reranker so the delta is the reranker's true effect, not
+  question-sampling noise. The "Latest run" panel above renders that paired table when present.</p>
 
   <h2>Orthopedic-specific considerations</h2>
   <div class="card">
@@ -510,17 +531,45 @@ python eval_ortho.py --n 20 --faithfulness  # + groundedness</pre>
 fetch('/api/eval').then(r => r.json()).then(d => {
   const el = document.getElementById('results');
   if (!d || !d.n) {
-    el.innerHTML = "<p class='muted'>No run yet. Run <code>python eval_ortho.py --n 40</code> and refresh.</p>";
+    el.innerHTML = "<p class='muted'>No run yet. Run <code>python eval_ortho.py --n 60 --hard --compare --faithfulness</code> and refresh.</p>";
     return;
   }
-  const m = (v, l) => `<div class="metric"><div class="v">${v}</div><div class="l">${l}</div></div>`;
   const pct = x => (x * 100).toFixed(0) + '%';
+  const mode = d.question_mode === 'hard' ? 'hard (paraphrased)' : 'easy (specific)';
+  const stamp = `<div class="stamp">corpus <code>${d.corpus}</code> · ${d.corpus_chunks.toLocaleString()} chunks · `
+    + `${d.n} questions · top-${d.k} · question mode: <b>${mode}</b> · judge ${d.model} · ${d.generated_at}</div>`;
+
+  // Paired A/B (--compare): same questions retrieved with vs without the reranker.
+  if (d.compare) {
+    const off = d.compare.off, on = d.compare.on;
+    let rows =
+      `<tr><td>Hit@${d.k}</td><td>${pct(off.hit_at_k)}</td><td>${pct(on.hit_at_k)}</td></tr>` +
+      `<tr><td>MRR</td><td>${off.mrr.toFixed(3)}</td><td>${on.mrr.toFixed(3)}</td></tr>`;
+    if (off.faithfulness != null)
+      rows += `<tr><td>Faithfulness</td><td>${off.faithfulness.toFixed(1)}%</td><td>${on.faithfulness.toFixed(1)}%</td></tr>`;
+    el.innerHTML =
+      `<p style="margin-top:0">Paired A/B — the <b>same</b> questions retrieved with and without the `
+      + `stage-2 cross-encoder reranker, so any gap is the reranker's true effect, not question-sampling noise.</p>`
+      + `<div class="tablewrap"><table style="min-width:auto">`
+      + `<thead><tr><th>metric</th><th>rerank OFF</th><th>rerank ON</th></tr></thead>`
+      + `<tbody>${rows}</tbody></table></div>`
+      + (off.faithfulness != null
+          ? `<p class="note" style="margin-top:14px">Typical result on hard questions: the reranker is roughly `
+            + `<b>neutral on source-recall</b> (Hit@k/MRR) but <b>lifts faithfulness</b>. On a dense corpus where many `
+            + `abstracts answer a paraphrased question, single-source Hit@k is the wrong lens for a reranker — it `
+            + `reshuffles <i>among</i> relevant docs, which shows up in answer grounding, not source recall.</p>`
+          : '')
+      + stamp;
+    return;
+  }
+
+  // Single-config run.
+  const m = (v, l) => `<div class="metric"><div class="v">${v}</div><div class="l">${l}</div></div>`;
   let cards = m(pct(d.hit_at_k), `Hit@${d.k}`) + m(d.mrr.toFixed(3), 'MRR');
   if (d.faithfulness !== null && d.faithfulness !== undefined)
     cards += m(d.faithfulness.toFixed(0) + '%', 'Faithfulness');
-  cards += m(d.n, 'questions') + m(d.corpus_chunks.toLocaleString(), 'corpus chunks');
-  el.innerHTML = `<div class="metrics">${cards}</div>` +
-    `<div class="stamp">corpus <code>${d.corpus}</code> · embedder ${d.embedder} · judge ${d.model} · generated ${d.generated_at}</div>`;
+  cards += m(d.rerank ? 'on' : 'off', 'reranker') + m(d.n, 'questions');
+  el.innerHTML = `<div class="metrics">${cards}</div>` + stamp;
 });
 </script>
 </body>
