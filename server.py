@@ -514,6 +514,48 @@ python eval_ortho.py --n 40 --hard --compare --faithfulness   # + answer groundi
   questions with and without the reranker so the delta is the reranker's true effect, not
   question-sampling noise. The "Latest run" panel above renders that paired table when present.</p>
 
+  <h2>Planned metrics — and why they matter</h2>
+  <p>Two metrics are marked <span class="s-plan">○ planned</span> above because they're the
+  most valuable next additions for a <i>medical</i> RAG system. Here's what each measures and how
+  we'd build it.</p>
+
+  <div class="card" style="margin-bottom:14px">
+    <p style="margin-top:0"><b>1. Citation accuracy</b> — does the cited span actually back the claim?</p>
+    <p>Every answer here already ships <b>native character-span citations</b>: each grounded sentence
+    points at an exact chunk and the exact characters within it. Citation accuracy asks the next
+    question — when the model says "<i>[PMID 12345] found a 2% infection rate</i>," does that cited span
+    <i>really</i> say that?</p>
+    <p>This is <b>distinct from faithfulness</b>. Faithfulness scores whether the answer as a whole is
+    supported by the retrieved context; citation accuracy checks each individual pointer. An answer can
+    be broadly grounded yet cite the <i>wrong</i> sentence — which, in medicine, is the difference
+    between "trust me" and "here is the exact line in this paper." Verifiable citations are what let a
+    clinician audit an answer instead of taking it on faith.</p>
+    <p style="margin-bottom:0"><b>How we'd measure it:</b> for each cited claim, run an entailment check
+    — an LLM judge (or a natural-language-inference model) decides whether the cited span <i>entails</i>
+    the claim. Report the fraction of citations that genuinely support their claim. Cheap, because we
+    already have the exact spans to check.</p>
+  </div>
+
+  <div class="card">
+    <p style="margin-top:0"><b>2. Multi-relevant retrieval</b> — Precision@k &amp; nDCG, not just "the one source."</p>
+    <p>Our current Hit@k asks only "<i>did the single source PMID come back?</i>" But on a paraphrased
+    question, <b>many</b> of the 34k abstracts answer it equally well — so Hit@k under-credits a good
+    retriever, and (as the reranker A/B showed) it's <b>blind to reranking</b>, which reshuffles
+    <i>among</i> relevant docs. A multi-relevant metric fixes the blind spot.</p>
+    <p>Instead of checking one PMID, we judge <b>each</b> retrieved chunk for relevance — graded
+    <code>0 / 1 / 2</code> (irrelevant / partial / on-point) by an LLM judge — then compute:</p>
+    <ul style="margin:6px 0">
+      <li><b>Precision@k</b> — what fraction of the top-k are actually relevant (catches padding the
+      results with off-topic hits).</li>
+      <li><b>nDCG@k</b> — graded ranking quality: rewards putting <i>highly</i>-relevant docs at the top,
+      not merely somewhere in the k.</li>
+    </ul>
+    <p style="margin-bottom:0">This is the metric where the reranker <b>should</b> visibly win, because
+    it credits surfacing <i>any</i> good abstract rather than one specific source. <b>Cost:</b> ~k judge
+    calls per question — more than Hit@k's zero, which is why it's a deliberate next step rather than the
+    default.</p>
+  </div>
+
   <h2>Orthopedic-specific considerations</h2>
   <div class="card">
     <ul>
