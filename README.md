@@ -22,6 +22,25 @@ question ──▶ embed ─┤                                              │
                               answer + cited sources (real PMIDs)
 ```
 
+## What this demonstrates
+
+A compact but complete picture of production-minded, security-aware RAG — each
+capability is a small, readable module, not a framework call:
+
+| Capability | What it shows | Where |
+|---|---|---|
+| **Access-controlled retrieval** | Clearance + need-to-know enforced as a vector-store **pre-filter** — unauthorized docs never reach the model | `access.py`, `query.py` |
+| **Federated multi-silo retrieval** | Fan-out across independent, separately-governed silos with **two-level access** + a distance-merged, provenance-tagged result | `federated.py`, `build_silos.py` |
+| **Air-gap / offline capable** | One interface, frontier Claude API **or** a fully-local model — identical pipeline, no internet | `llm.py` |
+| **Rigorous evaluation** | Label-free synthetic eval, **paired A/B**, Hit@k · MRR · Precision@k · nDCG@k · LLM-judge faithfulness — used to *reject* a reranker that didn't earn its place | `eval_ortho.py` |
+| **Real provenance & citations** | Native character-span citations pointing at genuine PMIDs | `query.py` |
+| **Auditability** | Append-only log of who retrieved what, when, under which filter | `audit.py` |
+| **Two-stage retrieval** | Bi-encoder recall → cross-encoder rerank (measured, optional) | `reranker.py` |
+| **Live data pipeline** | 27K abstracts pulled from NCBI PubMed, cached for offline/reproducible ingest | `pubmed.py`, `download_corpus.py` |
+
+Everything runs locally on a single GPU; the only external call is the optional
+Claude API for generation. See the sections below for the how and why of each.
+
 ## What's in the corpus
 
 Live-fetched from NCBI PubMed via the Entrez API, cached locally so ingest is
