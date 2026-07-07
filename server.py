@@ -30,6 +30,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+import access
+import audit
 import config
 import llm
 from query import get_collection, retrieve, answer, _provenance
@@ -50,15 +52,15 @@ def collection():
     return _collection
 
 
-def do_retrieve(question: str, k: int, rerank: bool = False):
+def do_retrieve(question: str, k: int, rerank: bool = False, where: dict | None = None):
     """Retrieve, re-opening the collection if the cached handle went stale
     (e.g. the corpus was rebuilt while this server was running)."""
     global _collection
     try:
-        return retrieve(collection(), question, k, rerank=rerank)
+        return retrieve(collection(), question, k, rerank=rerank, where=where)
     except Exception:
         _collection = None
-        return retrieve(collection(), question, k, rerank=rerank)
+        return retrieve(collection(), question, k, rerank=rerank, where=where)
 
 
 # --- API -------------------------------------------------------------------
@@ -67,6 +69,7 @@ class Query(BaseModel):
     k: int = config.TOP_K
     backend: str = "claude"   # "claude" (frontier API) or "local" (offline Ollama)
     rerank: bool = False      # add the cross-encoder stage-2 reranker
+    user: str | None = None   # access-control principal (access.USERS key), or None = no filter
 
 
 @app.get("/api/config")
@@ -82,13 +85,36 @@ def api_config():
         "top_k": config.TOP_K,
         "collection": config.COLLECTION_NAME,
         "has_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "roles": [
+            {
+                "name": u.name,
+                "clearance": u.clearance_name,
+                "compartments": "ALL" if u.compartments == access.ALL_COMPARTMENTS
+                                else sorted(u.compartments),
+            }
+            for u in access.USERS.values()
+        ],
+        # Example questions to prefill — the first two straddle compartments the
+        # clinician lacks (oncology, infection), so the access effect is visible.
+        "examples": [
+            "Surgical management of bone sarcoma and musculoskeletal oncology",
+            "Diagnosis and treatment of periprosthetic joint infection",
+            "Risk factors for deep vein thrombosis after total knee arthroplasty",
+            "When is spinal fusion indicated for adolescent scoliosis?",
+        ],
     }
 
 
 @app.post("/api/query")
 def api_query(q: Query):
-    """question -> retrieve top-k (optionally reranked) -> (optionally) Claude answer + citations."""
-    hits = do_retrieve(q.question, q.k, q.rerank)
+    """question -> (access pre-filter) -> retrieve top-k (optionally reranked) -> answer + citations."""
+    # Access control: if a known principal is selected, build the pre-filter so
+    # unauthorized chunks never enter the candidate set (see access.py).
+    user = access.USERS.get(q.user) if q.user else None
+    where = access.build_where(user) if user else None
+    hits = do_retrieve(q.question, q.k, q.rerank, where)
+    if user:
+        audit.record_retrieval(user, q.question, hits, where, backend=q.backend)
 
     chunks = []
     for i, (t, m, d) in enumerate(hits):
@@ -98,12 +124,15 @@ def api_query(q: Query):
             "source": f"{kind} {ident}",
             "title": m.get("title", ""),
             "distance": round(float(d), 3),
+            "classification": access.LEVEL_NAME.get(m.get("classification")) if "classification" in m else None,
+            "compartment": m.get("compartment"),
             "text": t,
         })
     result = {
         "question": q.question, "chunks": chunks,
         "answered": False, "answer": None, "citations": [],
         "backend": q.backend, "model": None, "reranked": q.rerank,
+        "access": {"user": user.name, "clearance": user.clearance_name, "where": where} if user else None,
     }
 
     # Route to the chosen backend. Claude needs a key; local needs none (offline).
@@ -258,6 +287,17 @@ HTML = """<!doctype html>
   .chunk .text { font-size: 13.5px; color: #c3d0de; }
   .muted { color: #7d8fa3; }
   .hidden { display: none; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .chip { font-size: 12.5px; padding: 6px 11px; border-radius: 999px; cursor: pointer;
+    background: #131a22; color: #9fb2c8; border: 1px solid #2a3441; }
+  .chip:hover { border-color: #2f81f7; color: #cfe0f3; }
+  .access-line { margin-top: 12px; font-size: 13px; color: #9fb2c8; }
+  .access-line b { color: #cfe0f3; }
+  .clsbadge { font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; letter-spacing: .03em; }
+  .cls-UNCLASSIFIED { background: #14301f; color: #4cc38a; border: 1px solid #1c5236; }
+  .cls-CONFIDENTIAL { background: #2e2a12; color: #d0b23a; border: 1px solid #52481c; }
+  .cls-SECRET { background: #33230f; color: #e0913a; border: 1px solid #5a3d18; }
+  .cls-TOP_SECRET { background: #3a1620; color: #f0637e; border: 1px solid #5e2233; }
 </style>
 </head>
 <body>
@@ -274,7 +314,9 @@ HTML = """<!doctype html>
 <main>
   <form id="f">
     <input type="text" id="q" placeholder="Ask an orthopedic question…"
-           value="What are risk factors for deep vein thrombosis after total knee arthroplasty?" autofocus>
+           value="Surgical management of bone sarcoma and musculoskeletal oncology" autofocus>
+    <div class="kbox" title="Retrieve AS this principal — access-control pre-filter by clearance + need-to-know">role
+      <select id="role"><option value="">— none —</option></select></div>
     <div class="kbox">model
       <select id="backend">
         <option value="claude">Claude (API)</option>
@@ -285,6 +327,8 @@ HTML = """<!doctype html>
       <input type="checkbox" id="rerank"> rerank</label>
     <button id="go" type="submit">Ask</button>
   </form>
+  <div class="access-line" id="accessLine"></div>
+  <div class="chips" id="examples"></div>
 
   <div class="card hidden" id="answerCard">
     <h2 id="answerHead">Answer</h2>
@@ -300,8 +344,9 @@ HTML = """<!doctype html>
 
 <script>
 const $ = id => document.getElementById(id);
+let ROLES = {};
 
-// Show what's under the hood on load.
+// Show what's under the hood on load, and populate roles + example questions.
 fetch('/api/config').then(r => r.json()).then(c => {
   $('badges').innerHTML =
     `<span class="badge">embedder <b>${c.embedder}</b></span>` +
@@ -311,7 +356,36 @@ fetch('/api/config').then(r => r.json()).then(c => {
     `<span class="badge">top-k <b>${c.top_k}</b></span>` +
     `<span class="badge">Claude key <b>${c.has_key ? 'set' : 'not set'}</b></span>`;
   $('k').value = c.top_k;
+
+  // Access-control roles → dropdown.
+  (c.roles || []).forEach(r => {
+    ROLES[r.name] = r;
+    const o = document.createElement('option');
+    o.value = r.name; o.textContent = r.name + ' (' + r.clearance + ')';
+    $('role').appendChild(o);
+  });
+  updateAccessLine();
+
+  // Prefilled example questions → clickable chips.
+  $('examples').innerHTML = (c.examples || [])
+    .map(q => `<span class="chip">${escapeHtml(q)}</span>`).join('');
+  document.querySelectorAll('#examples .chip').forEach(ch =>
+    ch.addEventListener('click', () => { $('q').value = ch.textContent; $('q').focus(); }));
 });
+
+function updateAccessLine() {
+  const r = ROLES[$('role').value];
+  if (!r) {
+    $('accessLine').innerHTML = '<span class="muted">No access control — retrieving over the full corpus.</span>';
+    return;
+  }
+  const comps = Array.isArray(r.compartments) ? r.compartments.join(', ') : r.compartments;
+  $('accessLine').innerHTML = `Retrieving as <b>${r.name}</b> — clearance <b>${r.clearance}</b>, `
+    + `need-to-know <b>${comps}</b>. Unauthorized documents are filtered out <i>before</i> retrieval, `
+    + `so they never reach the model.`;
+}
+
+$('role').addEventListener('change', updateAccessLine);
 
 $('f').addEventListener('submit', async e => {
   e.preventDefault();
@@ -322,7 +396,8 @@ $('f').addEventListener('submit', async e => {
     const res = await fetch('/api/query', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ question, k: Number($('k').value),
-                             backend: $('backend').value, rerank: $('rerank').checked })
+                             backend: $('backend').value, rerank: $('rerank').checked,
+                             user: $('role').value || null })
     });
     const data = await res.json();
     render(data);
@@ -344,15 +419,21 @@ function render(data) {
 
   // Chunks (similarity bar = 1 - cosine distance)
   $('chunkCard').classList.remove('hidden');
-  $('chunkHead').textContent = data.reranked
+  let head = data.reranked
     ? 'Retrieved chunks — reordered by cross-encoder (distance no longer monotonic)'
     : 'Retrieved chunks (lower distance = closer)';
+  if (data.access) head += ` · as ${data.access.user} (${data.access.clearance})`;
+  $('chunkHead').textContent = head;
   $('chunks').innerHTML = data.chunks.map(ch => {
     const sim = Math.max(0, 1 - ch.distance);
+    const cls = ch.classification
+      ? `<span class="clsbadge cls-${ch.classification}">${ch.classification}</span>` : '';
+    const comp = ch.compartment ? `<span>${escapeHtml(ch.compartment)}</span>` : '';
     return `<div class="chunk">
       <div class="meta">
         <span>#${ch.rank}</span>
         <span>${escapeHtml(ch.source)}</span>
+        ${cls}${comp}
         <span>dist ${ch.distance.toFixed(3)}</span>
         <span class="simbar"><span style="width:${(sim*100).toFixed(0)}%"></span></span>
       </div>
