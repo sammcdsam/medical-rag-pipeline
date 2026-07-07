@@ -96,6 +96,11 @@ def api_config():
             }
             for u in access.USERS.values()
         ],
+        "clearances": [name for name, _lvl in sorted(access.CLEARANCE.items(), key=lambda kv: kv[1])],
+        "silos": [
+            {"name": s, "label": meta["label"], "min_clearance": access.LEVEL_NAME[meta["min_clearance"]]}
+            for s, meta in federated.SILOS.items()
+        ],
         # Example questions to prefill — the first two straddle compartments the
         # clinician lacks (oncology, infection), so the access effect is visible.
         "examples": [
@@ -246,6 +251,11 @@ def corpus_page():
     return CORPUS_HTML
 
 
+@app.get("/security", response_class=HTMLResponse)
+def security_page():
+    return SECURITY_HTML
+
+
 # --- Frontend --------------------------------------------------------------
 # A single self-contained page: no build step, no external assets. Plain CSS
 # and fetch(). Kept deliberately small so it's readable end to end.
@@ -319,6 +329,7 @@ HTML = """<!doctype html>
   <div class="topbar">
     <h1>Orthopedic RAG demo <span class="muted" style="font-weight:400">— live PubMed</span></h1>
     <nav class="nav">
+      <a class="navlink" href="/security">Security &rarr;</a>
       <a class="navlink" href="/corpus">Corpus &rarr;</a>
       <a class="navlink" href="/eval">Eval &rarr;</a>
     </nav>
@@ -365,7 +376,7 @@ HTML = """<!doctype html>
 
 <script>
 const $ = id => document.getElementById(id);
-let ROLES = {};
+let ROLES = {}, SILOS = [], CLEARANCES = [];
 
 // Show what's under the hood on load, and populate roles + example questions.
 fetch('/api/config').then(r => r.json()).then(c => {
@@ -379,6 +390,8 @@ fetch('/api/config').then(r => r.json()).then(c => {
   $('k').value = c.top_k;
 
   // Access-control roles → dropdown.
+  SILOS = c.silos || [];
+  CLEARANCES = c.clearances || [];
   (c.roles || []).forEach(r => {
     ROLES[r.name] = r;
     const o = document.createElement('option');
@@ -396,17 +409,38 @@ fetch('/api/config').then(r => r.json()).then(c => {
 
 function updateAccessLine() {
   const r = ROLES[$('role').value];
-  if (!r) {
-    $('accessLine').innerHTML = '<span class="muted">No access control — retrieving over the full corpus.</span>';
-    return;
+  const fed = $('federated').checked;
+  const help = ' <a class="navlink" href="/security">how it works &rarr;</a>';
+  const parts = [];
+
+  if (r) {
+    const comps = Array.isArray(r.compartments) ? r.compartments.join(', ') : r.compartments;
+    parts.push(`Retrieving as <b>${r.name}</b> — clearance <b>${r.clearance}</b>, need-to-know <b>${comps}</b>. `
+      + `Unauthorized documents are filtered out <i>before</i> retrieval, so they never reach the model.`);
+  } else {
+    parts.push('<span class="muted">No access control — retrieving over the full corpus.</span>');
   }
-  const comps = Array.isArray(r.compartments) ? r.compartments.join(', ') : r.compartments;
-  $('accessLine').innerHTML = `Retrieving as <b>${r.name}</b> — clearance <b>${r.clearance}</b>, `
-    + `need-to-know <b>${comps}</b>. Unauthorized documents are filtered out <i>before</i> retrieval, `
-    + `so they never reach the model.`;
+
+  if (fed) {
+    // Which silos can this principal even query? (silo-level authorization)
+    const principal = r || ROLES['director'];
+    let note = '';
+    if (principal && SILOS.length && CLEARANCES.length) {
+      const rank = CLEARANCES.indexOf(principal.clearance);
+      const can = SILOS.filter(s => CLEARANCES.indexOf(s.min_clearance) <= rank);
+      const skip = SILOS.filter(s => CLEARANCES.indexOf(s.min_clearance) > rank);
+      note = ` Querying <b>${can.length} of ${SILOS.length}</b> silos`
+        + (skip.length ? ` (skipping ${skip.map(s => s.label).join(', ')} — clearance too low)` : '')
+        + `, then merging the results.`;
+    }
+    parts.push(`<b>Federated:</b> the query fans out across independent siloed sources.${note}`);
+  }
+
+  $('accessLine').innerHTML = parts.join('<br>') + help;
 }
 
 $('role').addEventListener('change', updateAccessLine);
+$('federated').addEventListener('change', updateAccessLine);
 
 $('f').addEventListener('submit', async e => {
   e.preventDefault();
@@ -876,6 +910,182 @@ fetch('/api/corpus').then(r => r.json()).then(d => {
     '</tbody></table></div>';
 
   body.innerHTML = html;
+});
+</script>
+</body>
+</html>"""
+
+
+# --- /security explainer page ----------------------------------------------
+# Plain-language walk-through of access control + federated silos: what the role
+# dropdown and the `federated` toggle on the demo actually do. Renders the roles,
+# silos, and a role x silo access matrix live from /api/config.
+SECURITY_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access control & federation — Orthopedic RAG</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.6 system-ui, sans-serif; background: #0e1116; color: #e6edf3; }
+  header { padding: 20px 24px; border-bottom: 1px solid #232b36; display: flex;
+           justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: 18px; }
+  a.navlink { color: #2f81f7; text-decoration: none; font-size: 14px; font-weight: 600; }
+  a.navlink:hover { text-decoration: underline; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px; }
+  h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .06em; color: #7d8fa3; margin: 34px 0 12px; }
+  p { color: #c3d0de; }
+  .lead { font-size: 16px; }
+  .card { background: #131a22; border: 1px solid #232b36; border-radius: 10px; padding: 16px 18px; margin-bottom: 12px; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 520px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #1e2731; vertical-align: top; }
+  th { color: #7d8fa3; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .05em; }
+  code { background: #1b2430; padding: 1px 6px; border-radius: 5px; font-size: 13px; color: #cfe0f3; }
+  .yes { color: #4cc38a; font-weight: 700; } .no { color: #f0637e; font-weight: 700; }
+  .ladder { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .lvl { padding: 4px 10px; border-radius: 6px; font-size: 13px; font-weight: 600; border: 1px solid #2a3441; background: #0e1116; }
+  .arrow { color: #7d8fa3; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 640px) { .two { grid-template-columns: 1fr; } }
+  .good { border-left: 3px solid #3fb950; padding-left: 12px; }
+  .bad { border-left: 3px solid #f0637e; padding-left: 12px; }
+  .note { border-left: 3px solid #d29922; padding-left: 12px; color: #c3d0de; }
+  .muted { color: #7d8fa3; }
+  b.hl { color: #cfe0f3; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Access control &amp; federation <span class="muted" style="font-weight:400">/ how secure retrieval works</span></h1>
+  <a class="navlink" href="/">&larr; back to demo</a>
+</header>
+<main>
+
+  <p class="lead">The demo can retrieve <b>as a specific user</b>, and can search <b>across separate
+  siloed sources</b>. This page explains what those two controls do — the same problem a secure
+  data-sharing system solves: let people find what they're allowed to see, and nothing else.</p>
+  <p class="muted">Note: the corpus is public PubMed, so the security labels here are <b>synthetic</b> —
+  a realistic stand-in (classification from a hash of the PMID; compartment = the paper's subtopic)
+  so the mechanism is demonstrable.</p>
+
+  <h2>1 · Access control — two independent questions</h2>
+  <p>Whether a user may see a document is gated on two <i>separate</i> axes. You need to pass
+  <b>both</b>.</p>
+
+  <div class="card">
+    <p style="margin-top:0"><b class="hl">Clearance</b> — hierarchical. Higher levels can see everything
+    at or below them.</p>
+    <div class="ladder" id="ladder"></div>
+    <p style="margin-bottom:0" class="muted">A user with <code>SECRET</code> clearance can read
+    UNCLASSIFIED, CONFIDENTIAL and SECRET documents — but not TOP_SECRET.</p>
+  </div>
+
+  <div class="card">
+    <p style="margin-top:0"><b class="hl">Need-to-know (compartments)</b> — NOT hierarchical. Each topic
+    is a locked room; you hold keys to some of them. High clearance does <i>not</i> grant a key you
+    weren't given. Here the ten orthopedic subtopics (arthroplasty, spine, oncology, infection, …) are
+    the compartments.</p>
+    <p style="margin-bottom:0" class="muted">So a clinician with high clearance but no
+    <code>oncology</code> key sees <b>zero</b> oncology papers — clearance can't override need-to-know.</p>
+  </div>
+
+  <p>The three demo roles you can pick from the dropdown:</p>
+  <div class="tablewrap"><table id="rolesTable"><thead><tr>
+    <th>Role</th><th>Clearance</th><th>Need-to-know (compartments)</th></tr></thead>
+    <tbody><tr><td colspan="3" class="muted">loading…</td></tr></tbody></table></div>
+
+  <h2>2 · Why it's a <i>pre-</i>filter (the important bit)</h2>
+  <p>The access rule is pushed into the vector database's query as a <code>where</code> clause, so it runs
+  <b>during</b> the search. Unauthorized chunks never come back at all.</p>
+  <div class="two">
+    <div class="card good"><p style="margin:0"><b>Pre-filter ✓ (what we do)</b><br>
+    Filter inside the search. Blocked documents are never retrieved, so they can't leak into the context,
+    the citations, or the model's answer — and the model never even reads them.</p></div>
+    <div class="card bad"><p style="margin:0"><b>Post-filter ✗ (the trap)</b><br>
+    Retrieve everything, then drop the unauthorized rows afterward. Too late — the text was already pulled
+    (a leak), and dropping rows silently shrinks your results below <code>k</code>.</p></div>
+  </div>
+
+  <h2>3 · Federated silos — what the <code>federated</code> toggle does</h2>
+  <div class="card">
+    <p style="margin-top:0"><b class="hl">What's a silo?</b> An <b>independent source</b> that keeps its own
+    data and doesn't hand over its whole index — think of four different organizations, each with its own
+    filing cabinet. Real secure-sharing systems don't own one big database; they must <b>discover across many
+    separately-governed sources</b>. So we split the corpus into four independent indexes:</p>
+    <div class="tablewrap"><table id="silosTable"><thead><tr>
+      <th>Silo (source)</th><th>Minimum clearance to query it</th></tr></thead>
+      <tbody><tr><td colspan="2" class="muted">loading…</td></tr></tbody></table></div>
+  </div>
+  <p>Turning on <code>federated</code> makes one question fan out across silos, in <b>two levels</b> of access:</p>
+  <div class="card"><ol style="margin:0; padding-left:20px">
+    <li><b>Silo-level authorization</b> — if your clearance is below a silo's minimum, your query <b>never
+    touches it</b> (it's skipped, and the demo tells you which). A whole source is off-limits.</li>
+    <li><b>Document-level pre-filter</b> — inside each silo you <i>can</i> query, the same clearance +
+    need-to-know rule from §1 still filters individual documents.</li>
+    <li><b>Merge</b> — the results from each silo are combined into one ranked list, and every result is
+    tagged with <b>which silo it came from</b> (provenance).</li>
+  </ol></div>
+
+  <p>Which silos each role can even <i>query</i> (silo-level authorization):</p>
+  <div class="tablewrap"><table id="matrix"><thead><tr><th>Role \\ Silo</th></tr></thead>
+    <tbody><tr><td class="muted">loading…</td></tr></tbody></table></div>
+  <p class="note" style="margin-top:12px"><b>Merge caveat</b> (worth knowing): all silos share one embedding
+  model here, so their similarity scores are directly comparable and we can merge by distance. A real
+  federation with a <i>different</i> model per silo would need score normalization or a reranker to merge
+  fairly.</p>
+
+  <h2>4 · Try it — the telling example</h2>
+  <p>On the <a class="navlink" href="/">demo</a>, load the example <b>"bone sarcoma / oncology"</b> and ask it
+  as each role:</p>
+  <div class="card"><ul style="margin:0">
+    <li><b>public</b> — only UNCLASSIFIED oncology papers come back.</li>
+    <li><b>clinician</b> — <b>no oncology at all</b> (SECRET clearance, but no oncology need-to-know); it
+    falls back to nearby topics it does hold.</li>
+    <li><b>director</b> — retrieves SECRET- and TOP_SECRET-classified oncology papers no one else can see.</li>
+  </ul></div>
+  <p>With <code>federated</code> also on, watch the silo report: <b>public</b> can only query 2 of 4 silos
+  (the CONFIDENTIAL and SECRET silos are skipped), while <b>director</b> fans out across all four.</p>
+
+  <h2>5 · Audit</h2>
+  <p>Every access-controlled retrieval is written to an append-only log (<code>audit_log.jsonl</code>): who
+  asked, when, the query, the exact filter applied, and which documents (with classification) were returned —
+  so you can prove after the fact exactly what each user was shown.</p>
+
+</main>
+
+<script>
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+fetch('/api/config').then(r => r.json()).then(c => {
+  const clr = c.clearances || [];
+  // clearance ladder
+  document.getElementById('ladder').innerHTML = clr.map((l, i) =>
+    `<span class="lvl">${esc(l)}</span>` + (i < clr.length-1 ? '<span class="arrow">&lt;</span>' : '')).join('');
+
+  // roles table
+  document.querySelector('#rolesTable tbody').innerHTML = (c.roles || []).map(r => {
+    const comp = Array.isArray(r.compartments) ? r.compartments.join(', ') : r.compartments;
+    return `<tr><td><b>${esc(r.name)}</b></td><td>${esc(r.clearance)}</td><td>${esc(comp)}</td></tr>`;
+  }).join('');
+
+  // silos table
+  document.querySelector('#silosTable tbody').innerHTML = (c.silos || []).map(s =>
+    `<tr><td><b>${esc(s.label)}</b></td><td>${esc(s.min_clearance)}</td></tr>`).join('');
+
+  // role x silo access matrix
+  const rank = l => clr.indexOf(l);
+  const silos = c.silos || [];
+  const head = '<tr><th>Role \\\\ Silo</th>' + silos.map(s => `<th>${esc(s.label)}</th>`).join('') + '</tr>';
+  const rows = (c.roles || []).map(r =>
+    `<tr><td><b>${esc(r.name)}</b> <span class="muted">(${esc(r.clearance)})</span></td>` +
+    silos.map(s => rank(r.clearance) >= rank(s.min_clearance)
+      ? '<td class="yes">can query</td>' : '<td class="no">skipped</td>').join('') + '</tr>').join('');
+  const m = document.getElementById('matrix');
+  m.querySelector('thead').innerHTML = head;
+  m.querySelector('tbody').innerHTML = rows;
 });
 </script>
 </body>
