@@ -30,14 +30,19 @@ from query import get_collection, retrieve, _provenance
 
 SYSTEM = (
     "You are a careful clinical research assistant answering questions from an "
-    "orthopedic literature corpus. You can only see what your search tools return, "
-    "and those results are already restricted to what the current user is authorized "
-    "to access — do not speculate about material outside them.\n\n"
-    "Work by searching for evidence, reading it, and searching again with a refined "
-    "query or a different sub-topic if needed (e.g. compare two procedures by searching "
-    "each). When you have enough grounded evidence, answer concisely and cite the "
-    "supporting PMIDs inline like (PMID 12345). If the authorized results do not contain "
-    "the answer, say so plainly rather than guessing."
+    "orthopedic literature corpus. Answer using ONLY what your search tools return — "
+    "those results are already restricted to what the current user may access; do not "
+    "speculate beyond them.\n\n"
+    "Your tools:\n"
+    "- search_corpus: broad search over ABSTRACTS (widest coverage of the literature).\n"
+    "- search_fulltext: deep search into the FULL TEXT of papers (methods, results, "
+    "effect sizes, specifics an abstract omits) — use it to read a promising paper closely.\n"
+    "- federated_search: search across access-gated data silos and merge.\n\n"
+    "Work like a researcher: search broadly first, then deep-read the most relevant papers, "
+    "reformulate or search a different sub-topic as needed, and synthesize across sources. "
+    "When comparing or reviewing evidence, note where studies agree and where they disagree. "
+    "Cite supporting PMIDs inline like (PMID 12345). If the authorized evidence does not "
+    "answer the question, say so plainly rather than guessing."
 )
 
 # The tool SCHEMAS Claude sees. Note there is NO `user`/clearance field — that is
@@ -50,6 +55,23 @@ TOOLS = [
             "best-matching abstract chunks (each with its PMID). Results are automatically "
             "restricted to what the current user may access. Call again with a refined query if "
             "the first results are off-target or you need a different sub-topic."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "A focused search query."},
+                "k": {"type": "integer", "description": "How many passages to return (default 5, max 10)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_fulltext",
+        "description": (
+            "Search the FULL TEXT of papers (not just abstracts) for a query. Returns passages "
+            "tagged with the section they came from (Introduction, Methods, Results, Discussion). "
+            "Use this to read a paper closely — for methods, sample sizes, effect sizes, and other "
+            "specifics abstracts leave out. Access-restricted like the other tools."
         ),
         "input_schema": {
             "type": "object",
@@ -93,10 +115,23 @@ def _format_hits(hits) -> str:
             tags.append(meta["compartment"])
         if meta.get("silo"):
             tags.append(f"silo:{federated.SILOS[meta['silo']]['label']}")
+        if meta.get("section"):
+            tags.append(f"§{meta['section']}")   # full-text: which section this came from
         tag = f" [{', '.join(tags)}]" if tags else ""
         snippet = text[:500].replace("\n", " ")
         lines.append(f"Result {i + 1}: PMID {pmid}{tag} (dist {dist:.3f})\n{snippet}")
     return "\n\n".join(lines)
+
+
+_ft_collection = None
+
+
+def _fulltext_collection():
+    """Lazily open the full-text collection (only if the agent actually deep-reads)."""
+    global _ft_collection
+    if _ft_collection is None:
+        _ft_collection = get_collection(config.COLLECTION_FULLTEXT)
+    return _ft_collection
 
 
 def _run_tool(name: str, tool_input: dict, user, collection):
@@ -106,7 +141,9 @@ def _run_tool(name: str, tool_input: dict, user, collection):
     try:
         if name == "federated_search":
             hits, _report = federated.federated_retrieve(query, user, k=k)
-        else:  # search_corpus (and anything unexpected → fail closed to a scoped search)
+        elif name == "search_fulltext":
+            hits = retrieve(_fulltext_collection(), query, k=k, where=access.build_where(user))
+        else:  # search_corpus (and anything unexpected → fail closed to a scoped abstract search)
             hits = retrieve(collection, query, k=k, where=access.build_where(user))
     except Exception as e:
         return f"(search error: {e})", []
@@ -123,7 +160,10 @@ def _level_mix(hits) -> dict:
     return mix
 
 
-def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 6, verbose: bool = True):
+AGENT_MAX_TOKENS = 2048   # roomy enough for a synthesized, multi-paper answer
+
+
+def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 8, verbose: bool = True):
     """Drive the agentic loop until Claude answers or we hit max_steps.
 
     Returns {answer, hits, steps, trace}. `trace` is a structured list of what the
@@ -136,7 +176,7 @@ def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 
 
     for step in range(1, max_steps + 1):
         resp = client.messages.create(
-            model=model, max_tokens=config.MAX_TOKENS,
+            model=model, max_tokens=AGENT_MAX_TOKENS,
             system=SYSTEM, tools=TOOLS, messages=messages,
         )
 
@@ -168,8 +208,18 @@ def run(question: str, user, model: str = config.CLAUDE_MODEL, max_steps: int = 
         answer = "".join(b.text for b in resp.content if b.type == "text")
         return {"answer": answer, "hits": all_hits, "steps": step, "trace": trace}
 
-    return {"answer": "(stopped: reached max_steps without a final answer)",
-            "hits": all_hits, "steps": max_steps, "trace": trace}
+    # Ran out of steps while still searching — force a final synthesis turn with no
+    # tools available, so a thorough researcher still gets a written answer.
+    if verbose:
+        print("  · (step limit reached — forcing synthesis)")
+    trace.append({"type": "thought", "step": max_steps, "text": "(step limit reached — synthesizing)"})
+    messages.append({"role": "user", "content":
+        "You have gathered enough evidence. Do not search further. Write your final answer "
+        "now: synthesize what you found, note where studies agree or disagree, and cite PMIDs."})
+    final = client.messages.create(model=model, max_tokens=AGENT_MAX_TOKENS,
+                                   system=SYSTEM, messages=messages)   # no tools -> must answer
+    answer = "".join(b.text for b in final.content if b.type == "text")
+    return {"answer": answer, "hits": all_hits, "steps": max_steps, "trace": trace}
 
 
 def main() -> None:
@@ -178,7 +228,7 @@ def main() -> None:
     parser.add_argument("--user", choices=tuple(access.USERS), default="director",
                         help="Run AS this principal — its clearance is bound to the tools (default: director).")
     parser.add_argument("--model", default=config.CLAUDE_MODEL, help="Claude model for the agent loop.")
-    parser.add_argument("--max-steps", type=int, default=6, help="Max tool-use rounds before giving up.")
+    parser.add_argument("--max-steps", type=int, default=8, help="Max tool-use rounds before forced synthesis.")
     args = parser.parse_args()
 
     user = access.USERS[args.user]

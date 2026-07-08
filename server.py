@@ -171,7 +171,7 @@ def api_query(q: Query):
 class AgentQuery(BaseModel):
     question: str
     user: str = "director"       # principal whose clearance is bound to the agent's tools
-    max_steps: int = 6
+    max_steps: int = 8
 
 
 @app.post("/api/agent")
@@ -187,7 +187,7 @@ def api_agent(q: AgentQuery):
         return {"error": "No ANTHROPIC_API_KEY set — the agent needs the Claude API to reason.",
                 "user": user.name, "clearance": user.clearance_name}
     try:
-        result = agent.run(q.question, user, max_steps=min(q.max_steps, 8), verbose=False)
+        result = agent.run(q.question, user, max_steps=min(q.max_steps, 10), verbose=False)
     except Exception as e:
         return {"error": f"agent error: {e}", "user": user.name, "clearance": user.clearance_name}
 
