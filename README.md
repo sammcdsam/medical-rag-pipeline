@@ -38,6 +38,7 @@ capability is a small, readable module, not a framework call:
 | **Real provenance & citations** | Native character-span citations pointing at genuine PMIDs | `query.py` |
 | **Auditability** | Append-only log of who retrieved what, when, under which filter | `audit.py` |
 | **Two-stage retrieval** | Bi-encoder recall → cross-encoder rerank (measured, optional) | `reranker.py` |
+| **Full-text ingestion** | PMC open-access JATS parsed into **section-aware chunks** with references captured (citation-graph-ready); ~50× more text/paper than abstracts | `pmc.py`, `ingest_fulltext.py` |
 | **Live data pipeline** | 27K abstracts pulled from NCBI PubMed, cached for offline/reproducible ingest | `pubmed.py`, `download_corpus.py` |
 
 Everything runs locally on a single GPU; the only external call is the optional
@@ -56,6 +57,27 @@ offline and reproducible:
 - Every chunk keeps its real **PMID + article title** as provenance, so citations
   point at genuine papers.
 
+## Full text (PMC open access)
+
+Abstracts are the default corpus; `pmc.py` additionally pulls **full text** for the
+open-access subset from PubMed Central: `PMID → PMCID` (NCBI ID Converter) →
+`efetch db=pmc` → JATS XML → **section-aware chunks** (a chunk never crosses a
+section boundary; each carries its heading) plus the article's **reference list
+with PMIDs** — the raw material for a citation graph. Only OA articles are fetched
+(non-OA return no `<body>`), and the text cache is git-ignored.
+
+Access labels are inherited from the PMID hash, so a paper's full text is
+access-controlled identically to its abstract.
+
+```bash
+python pmc.py --target 500      # cache OA full text (PMID→PMCID→JATS)
+python ingest_fulltext.py       # section-aware chunk → embed → orthopedic_fulltext
+python query.py "..." --fulltext --user clinician    # retrieve from full text
+```
+
+A 500-article pull yields ~9.8k section-tagged chunks; ~93% of their ~17.7k
+references carry a PMID (the citation graph is a natural next step).
+
 ## The pieces
 
 | File | Role |
@@ -65,6 +87,8 @@ offline and reproducible:
 | `reranker.py` | **Stage 2.** Cross-encoder (`BAAI/bge-reranker-base`) reranks the candidate pool. |
 | `pubmed.py` / `download_corpus.py` | Fetch orthopedic abstracts from NCBI Entrez → cache to JSONL. |
 | `ingest_pubmed.py` | Chunk → embed locally (GPU) → store in Chroma. Reads the local cache offline. |
+| `pmc.py` | Fetch PMC **open-access full text** (JATS) → sections + references; PMID→PMCID via idconv. |
+| `ingest_fulltext.py` | Section-aware chunk full text → embed → `orthopedic_fulltext` (access labels inherited). |
 | `query.py` | Question → retrieve (± rerank, ± access filter) → generate with citations → print answer + sources. |
 | `access.py` | Access-control model — clearance + need-to-know compartments; builds the retrieval pre-filter. |
 | `label_access.py` | One-time migration: stamp (synthetic) `classification` + `compartment` onto every chunk. |

@@ -156,7 +156,8 @@ def print_result(result: dict, hits) -> None:
         kind, ident = _provenance(meta)
         preview = text[:100].replace("\n", " ")
         tag = _access_tag(meta)
-        print(f"[{i}] {kind}={ident}  cos_dist={dist:.3f}  {tag}  {preview}...")
+        sec = f" §{meta['section']}" if meta.get("section") else ""   # full-text: which section
+        print(f"[{i}] {kind}={ident}  cos_dist={dist:.3f}  {tag}{sec}  {preview}...")
 
     print(f"\n=== ANSWER ({result['backend']} · {result['model']}) ===")
     print(result["answer"])
@@ -182,6 +183,8 @@ def main() -> None:
                         help="Retrieve AS this principal — access-control pre-filter by clearance + need-to-know.")
     parser.add_argument("--federated", action="store_true",
                         help="Fan the query out across access-gated silos and merge (see federated.py). Implies --user.")
+    parser.add_argument("--fulltext", action="store_true",
+                        help="Retrieve from the PMC full-text corpus instead of abstracts (section-tagged chunks).")
     args = parser.parse_args()
 
     import audit
@@ -204,7 +207,7 @@ def main() -> None:
         if user:
             where = access.build_where(user)
             print(f"\n=== ACCESS CONTEXT ===\n{user.describe()}\nwhere-filter: {where}")
-        collection = get_collection()
+        collection = get_collection(config.COLLECTION_FULLTEXT if args.fulltext else config.COLLECTION_NAME)
         hits = retrieve(collection, args.question, k=args.k, rerank=args.rerank, where=where)
         if user:
             audit.record_retrieval(user, args.question, hits, where, backend=args.model)
