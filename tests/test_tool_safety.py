@@ -11,10 +11,13 @@ import agent
 
 
 def test_agent_tools_do_not_expose_access_controls():
+    # Benign tool params only (query text, result count, a PMID to look up) — and
+    # crucially NONE that would let the model set or widen its own access.
+    allowed = {"query", "k", "pmid"}
     forbidden = {"user", "clearance", "classification", "compartment", "principal", "role", "silo"}
     for tool in agent.TOOLS:
         props = set(tool["input_schema"]["properties"])
-        assert props <= {"query", "k"}, f"{tool['name']} exposes unexpected params: {props}"
+        assert props <= allowed, f"{tool['name']} exposes unexpected params: {props - allowed}"
         assert not (props & forbidden), f"{tool['name']} exposes an access control to the model"
 
 

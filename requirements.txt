@@ -31,3 +31,7 @@ uvicorn[standard]==0.50.2
 # Model Context Protocol SDK — exposes the retriever as an MCP server (mcp_server.py)
 # so any MCP client (Claude Desktop, Claude Code, Cursor) can call it as a tool.
 mcp==1.28.1
+
+# Citation graph over the full-text reference lists (citation_graph.py) — the
+# "graph database" half of hybrid retrieval (find foundational papers, trace lineage).
+networkx==3.6.1

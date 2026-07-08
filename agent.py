@@ -37,7 +37,10 @@ SYSTEM = (
     "- search_corpus: broad search over ABSTRACTS (widest coverage of the literature).\n"
     "- search_fulltext: deep search into the FULL TEXT of papers (methods, results, "
     "effect sizes, specifics an abstract omits) — use it to read a promising paper closely.\n"
-    "- federated_search: search across access-gated data silos and merge.\n\n"
+    "- federated_search: search across access-gated data silos and merge.\n"
+    "- find_influential_papers: the most-cited (foundational) papers in the citation graph — "
+    "ground a review in seminal works.\n"
+    "- trace_citations: for a PMID, what it cites and which papers cite it — trace a finding's lineage.\n\n"
     "Work like a researcher: search broadly first, then deep-read the most relevant papers, "
     "reformulate or search a different sub-topic as needed, and synthesize across sources. "
     "When comparing or reviewing evidence, note where studies agree and where they disagree. "
@@ -98,6 +101,31 @@ TOOLS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "find_influential_papers",
+        "description": (
+            "Return the most-cited (foundational) papers in the corpus's CITATION GRAPH — the works "
+            "the literature is built on, ranked by how many corpus papers cite them. Use to ground a "
+            "review in seminal sources. This is graph structure, not semantic search; some results "
+            "are foundational works outside the corpus (search_fulltext to read the ones inside it)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"k": {"type": "integer", "description": "How many top papers (default 12)."}},
+        },
+    },
+    {
+        "name": "trace_citations",
+        "description": (
+            "For a given PMID, return what it CITES and which corpus papers CITE it — the paper's "
+            "place in the citation graph. Use to trace a finding's lineage or find related work."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"pmid": {"type": "string", "description": "The PMID to look up."}},
+            "required": ["pmid"],
+        },
+    },
 ]
 
 
@@ -134,8 +162,37 @@ def _fulltext_collection():
     return _ft_collection
 
 
+def _format_influential(papers) -> str:
+    if not papers:
+        return "(citation graph unavailable — is the full-text corpus ingested?)"
+    lines = [f"  {p['citations']}x  PMID {p['pmid']} "
+             f"{'[in corpus]' if p['in_corpus'] else '[external]'}  {p['title'][:80]}" for p in papers]
+    return "Most-cited (foundational) papers in the citation graph:\n" + "\n".join(lines)
+
+
+def _format_lineage(pmid: str, cites, cited_by) -> str:
+    if not cites and not cited_by:
+        return f"(PMID {pmid} is not in the citation graph.)"
+    out = [f"Citation lineage for PMID {pmid}:", f"  CITES {len(cites)} papers:"]
+    out += [f"    -> PMID {c['pmid']}  {c['title'][:70]}" for c in cites[:12]]
+    out.append(f"  CITED BY {len(cited_by)} corpus papers:")
+    out += [f"    <- PMID {c['pmid']}  {c['title'][:70]}" for c in cited_by[:12]]
+    return "\n".join(out)
+
+
 def _run_tool(name: str, tool_input: dict, user, collection):
     """Execute a tool with the user's access bound HERE — not passed by the model."""
+    # Citation-graph tools return bibliographic STRUCTURE (PMIDs/titles/counts), not
+    # document content — so no access pre-filter and no document hits here. The
+    # sensitive full text still requires the access-filtered search tools to read.
+    if name == "find_influential_papers":
+        import citation_graph
+        return _format_influential(citation_graph.influential(min(int(tool_input.get("k", 12)), 25))), []
+    if name == "trace_citations":
+        import citation_graph
+        pmid = str(tool_input.get("pmid", "")).strip()
+        return _format_lineage(pmid, citation_graph.cited_by(pmid), citation_graph.who_cites(pmid)), []
+
     query = tool_input.get("query", "")
     k = min(int(tool_input.get("k", config.TOP_K)), 10)
     try:
