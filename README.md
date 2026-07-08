@@ -29,7 +29,7 @@ capability is a small, readable module, not a framework call:
 
 | Capability | What it shows | Where |
 |---|---|---|
-| **Agentic retrieval** | Claude drives its own multi-hop retrieval loop; the user's clearance is bound at the **tool boundary**, so the model can't escalate — even under prompt injection | `agent.py` |
+| **Research agent** | Claude drives a multi-hop loop over three tools (abstract search, **full-text deep-read**, federated), synthesizing a cited review; clearance bound at the **tool boundary** so it can't escalate — even under prompt injection | `agent.py` |
 | **MCP server** | The access-bound retriever exposed over the Model Context Protocol — any MCP client (Claude Desktop/Code, Cursor) can call it; principal bound at launch | `mcp_server.py` |
 | **Access-controlled retrieval** | Clearance + need-to-know enforced as a vector-store **pre-filter** — unauthorized docs never reach the model | `access.py`, `query.py` |
 | **Federated multi-silo retrieval** | Fan-out across independent, separately-governed silos with **two-level access** + a distance-merged, provenance-tagged result | `federated.py`, `build_silos.py` |
@@ -270,14 +270,26 @@ from the DoD silo that no one else can reach.
 > heterogeneous federation (a different embedder per silo) would need score
 > normalisation or a cross-encoder rerank to merge fairly.
 
-## Agentic retrieval
+## Agentic retrieval — a research agent
 
 `query.py` runs a fixed pipeline (embed → retrieve → answer, once). `agent.py`
-hands Claude the retriever as **tools** and lets it drive its own loop — search,
-read the results, refine the query or search a different sub-topic, then answer.
-That unlocks what a single-shot pipeline can't: **multi-hop** questions ("compare
-infection risk after knee replacement vs spinal fusion" → it searches each, then
-compares), query reformulation, and honest abstention.
+hands Claude the retrieval tools and lets it drive its own loop — search, read,
+refine, search again, then answer. It has three tools:
+
+- **`search_corpus`** — broad search over abstracts (widest coverage)
+- **`search_fulltext`** — deep-read the **full text** of papers (methods, results,
+  effect sizes — the specifics abstracts omit)
+- **`federated_search`** — search across the access-gated silos and merge
+
+That makes it a small **research agent**: it searches broadly, deep-reads the most
+relevant papers, reformulates, synthesizes across sources (noting where studies
+agree or disagree), and writes a **cited literature review**. It runs a multi-step
+loop (bounded, with a forced-synthesis final turn) — so a question like *"what's
+the evidence that tranexamic acid reduces blood loss in total hip arthroplasty,
+with effect sizes?"* comes back as a structured review with real numbers
+(e.g. "~150 mL reduction", "10 RCTs, 1,295 patients") deep-read from the full text
+and cited by PMID. It also handles multi-hop comparisons, query reformulation,
+and honest abstention.
 
 The security-critical design: **the user's clearance is bound in the harness, not
 exposed as a tool parameter.** Claude only ever sees `search(query, k)`; every
