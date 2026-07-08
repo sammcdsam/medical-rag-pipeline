@@ -51,7 +51,9 @@ def _idconv(pmids: list[str]) -> dict:
         if data:
             for rec in data.get("records", []):
                 if rec.get("pmcid"):
-                    mapping[rec["pmid"]] = rec["pmcid"]   # e.g. "PMC13162543"
+                    # idconv may echo pmid as a JSON number — coerce to str so keys
+                    # match the string PMIDs in the abstract cache.
+                    mapping[str(rec["pmid"])] = rec["pmcid"]   # e.g. "PMC13162543"
         print(f"  mapped {min(i + 200, len(pmids))}/{len(pmids)} PMIDs -> {len(mapping)} in PMC")
         time.sleep(0.34)
     return mapping
