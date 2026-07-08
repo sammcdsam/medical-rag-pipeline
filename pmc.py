@@ -21,6 +21,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import Counter, deque
 
 import config
 import pubmed
@@ -131,55 +132,87 @@ def load_fulltext(path: str | None = None, limit: int | None = None) -> list[dic
 
 
 def download_fulltext(path: str | None = None, target: int | None = None,
-                      source: str | None = None) -> int:
-    """Map abstract PMIDs -> PMC, fetch OA full text, cache to JSONL (resumable).
+                      source: str | None = None, delay: float | None = None) -> int:
+    """Map abstract PMIDs -> PMC, fetch OA full text, cache to JSONL (resumable, balanced).
 
-    Resumes by skipping PMIDs already in the cache. Carries title/journal/year/
-    subtopic across from the abstract record so provenance and the access labels
-    line up with the abstract corpus.
+    BALANCED across subtopics: aims for target/N_subtopics articles per subtopic and
+    round-robins across them, so the corpus spans all of orthopedics rather than
+    filling up on whichever subtopic comes first. Resumes by skipping cached PMIDs
+    (and counts what's already saved toward each subtopic's quota). Robust for long
+    unattended runs: `delay` seconds between fetches (gentle on NCBI), and a failed
+    article is skipped rather than aborting the run.
     """
     path = path or config.FULLTEXT_CACHE
     target = target or config.FULLTEXT_TARGET
+    delay = config.PUBMED_PAGE_DELAY if delay is None else delay
 
     by_pmid = {d["pmid"]: d for d in pubmed.load_corpus(source) if d.get("pmid")}
-    done = {d["pmid"] for d in load_fulltext(path)}
+    cached = load_fulltext(path)
+    done = {d["pmid"] for d in cached}
     remaining = [p for p in by_pmid if p not in done]
     print(f"{len(by_pmid)} abstracts; {len(done)} full-text already cached; "
           f"mapping {len(remaining)} remaining PMIDs -> PMC...")
 
-    mapping = _idconv(remaining)
+    mapping = _idconv(remaining)   # pmid -> pmcid, PMC-linked only
+
+    # One queue of candidate PMIDs per subtopic; a per-subtopic quota for balance.
+    def sub_of(pmid: str) -> str:
+        return by_pmid[pmid].get("subtopic") or "(untagged)"
+
+    subs = sorted({sub_of(p) for p in mapping})
+    per_target = max(1, target // max(len(subs), 1))
+    queues = {s: deque() for s in subs}
+    for pmid in mapping:
+        queues[sub_of(pmid)].append(pmid)
+    saved_by_sub = Counter(sub_of(d["pmid"]) if d["pmid"] in by_pmid else (d.get("subtopic") or "(untagged)")
+                           for d in cached)
+    print(f"target {target} across {len(subs)} subtopics (~{per_target} each); "
+          f"gentle delay {delay}s/fetch")
+
     saved = len(done)
     with open(path, "a") as out:
-        for pmid, pmcid in mapping.items():
-            if saved >= target:
-                break
-            parsed = fetch_fulltext(pmcid)
-            time.sleep(config.PUBMED_PAGE_DELAY)
-            if not parsed or not parsed["sections"]:
-                continue   # not open-access, or nothing usable
-            src = by_pmid[pmid]
-            rec = {
-                "pmid": pmid, "pmcid": pmcid,
-                "title": src.get("title", ""), "journal": src.get("journal", ""),
-                "year": src.get("year", ""), "subtopic": src.get("subtopic", ""),
-                "sections": parsed["sections"], "references": parsed["references"],
-            }
-            out.write(json.dumps(rec) + "\n")
-            out.flush()
-            saved += 1
-            if saved % 20 == 0:
-                print(f"  {saved} full-text articles cached...")
+        progressed = True
+        while saved < target and progressed:
+            progressed = False
+            for s in subs:
+                if saved >= target or saved_by_sub[s] >= per_target or not queues[s]:
+                    continue
+                progressed = True
+                pmid = queues[s].popleft()
+                try:
+                    parsed = fetch_fulltext(mapping[pmid])
+                except Exception:
+                    parsed = None
+                time.sleep(delay)
+                if not parsed or not parsed["sections"]:
+                    continue   # not open-access / unusable — doesn't count toward the quota
+                src = by_pmid[pmid]
+                out.write(json.dumps({
+                    "pmid": pmid, "pmcid": mapping[pmid],
+                    "title": src.get("title", ""), "journal": src.get("journal", ""),
+                    "year": src.get("year", ""), "subtopic": src.get("subtopic", ""),
+                    "sections": parsed["sections"], "references": parsed["references"],
+                }) + "\n")
+                out.flush()
+                saved += 1
+                saved_by_sub[s] += 1
+                if saved % 25 == 0:
+                    mix = ", ".join(f"{k}:{v}" for k, v in sorted(saved_by_sub.items()))
+                    print(f"  {saved}/{target} cached | {mix}", flush=True)
 
     print(f"Done. {saved} full-text articles cached -> {path}")
+    print("by subtopic:", dict(sorted(saved_by_sub.items())))
     return saved
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch PMC open-access full text for the abstract corpus.")
     parser.add_argument("--target", type=int, default=config.FULLTEXT_TARGET,
-                        help="Max OA full-text articles to cache (each is one efetch call).")
+                        help="Total OA full-text articles to cache, balanced across subtopics.")
+    parser.add_argument("--delay", type=float, default=None,
+                        help="Seconds between fetches (gentle on NCBI for long runs; default from config).")
     args = parser.parse_args()
-    download_fulltext(target=args.target)
+    download_fulltext(target=args.target, delay=args.delay)
 
 
 if __name__ == "__main__":
