@@ -29,7 +29,8 @@ capability is a small, readable module, not a framework call:
 
 | Capability | What it shows | Where |
 |---|---|---|
-| **Research agent** | Claude drives a multi-hop loop over three tools (abstract search, **full-text deep-read**, federated), synthesizing a cited review; clearance bound at the **tool boundary** so it can't escalate — even under prompt injection | `agent.py` |
+| **Research agent** | Claude drives a multi-hop loop over five tools (abstract search, **full-text deep-read**, federated, + the two graph tools), synthesizing a cited review; clearance bound at the **tool boundary** so it can't escalate — even under prompt injection | `agent.py` |
+| **Citation graph** | Directed citation network from the full-text references — finds **foundational works** and traces lineage; the graph-structure query vector search can't do | `citation_graph.py` |
 | **MCP server** | The access-bound retriever exposed over the Model Context Protocol — any MCP client (Claude Desktop/Code, Cursor) can call it; principal bound at launch | `mcp_server.py` |
 | **Access-controlled retrieval** | Clearance + need-to-know enforced as a vector-store **pre-filter** — unauthorized docs never reach the model | `access.py`, `query.py` |
 | **Federated multi-silo retrieval** | Fan-out across independent, separately-governed silos with **two-level access** + a distance-merged, provenance-tagged result | `federated.py`, `build_silos.py` |
@@ -89,6 +90,7 @@ references carry a PMID (the citation graph is a natural next step).
 | `ingest_pubmed.py` | Chunk → embed locally (GPU) → store in Chroma. Reads the local cache offline. |
 | `pmc.py` | Fetch PMC **open-access full text** (JATS) → sections + references; PMID→PMCID via idconv. |
 | `ingest_fulltext.py` | Section-aware chunk full text → embed → `orthopedic_fulltext` (access labels inherited). |
+| `citation_graph.py` | Citation network (NetworkX) from the full-text references — foundational-paper ranking + lineage. |
 | `query.py` | Question → retrieve (± rerank, ± access filter) → generate with citations → print answer + sources. |
 | `access.py` | Access-control model — clearance + need-to-know compartments; builds the retrieval pre-filter. |
 | `label_access.py` | One-time migration: stamp (synthetic) `classification` + `compartment` onto every chunk. |
@@ -280,6 +282,8 @@ refine, search again, then answer. It has three tools:
 - **`search_fulltext`** — deep-read the **full text** of papers (methods, results,
   effect sizes — the specifics abstracts omit)
 - **`federated_search`** — search across the access-gated silos and merge
+- **`find_influential_papers`** / **`trace_citations`** — the **citation graph**:
+  foundational works and a paper's lineage (see below)
 
 That makes it a small **research agent**: it searches broadly, deep-reads the most
 relevant papers, reformulates, synthesizes across sources (noting where studies
@@ -308,6 +312,29 @@ Run it as different principals and inspect the "evidence pulled" list: as
 `public`, *every* document the agent touches across all its hops is UNCLASSIFIED;
 as `director`, it can reach the classified silos. The access ceiling holds through
 the entire multi-step loop, not just the first call.
+
+## Citation graph — hybrid retrieval
+
+The vector store answers *"what's semantically similar?"*. A **citation graph**
+answers a different question — *"how are papers connected, and what is the field
+built on?"* — which similarity search structurally cannot. `citation_graph.py`
+builds a directed network (NetworkX) from the reference lists captured in the full
+text: **500 corpus papers → ~14.8k nodes, ~16.4k citation edges**.
+
+Because a corpus's references point mostly at papers *outside* it, ranking by
+in-degree surfaces the field's **foundational works** even when they aren't in the
+corpus — e.g. it correctly ranks *"The operation of the century: total hip
+replacement"* and *"The 2018 definition of periprosthetic hip and knee infection"*
+at the top. The agent uses this to ground a review in seminal sources
+(`find_influential_papers`) and to trace a finding's lineage (`trace_citations`).
+
+```bash
+python citation_graph.py       # build the graph, print the most-cited papers
+```
+
+> Graph tools return **bibliographic structure** (PMIDs, titles, citation counts),
+> not document content — a deliberate metadata-vs-content boundary. Reading a
+> paper's text still goes through the access-filtered search tools.
 
 ## MCP server — the retriever as a reusable tool
 
