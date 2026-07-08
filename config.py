@@ -55,6 +55,7 @@ CHROMA_DIR = str(Path(__file__).parent / "chroma_db")
 # Two corpora live in the same on-disk store as separate collections:
 COLLECTION_PUBMEDQA = "pubmed_contexts"     # original PubMedQA baseline (ingest.py / eval.py)
 COLLECTION_ORTHO = "orthopedic_pubmed"      # live-PubMed orthopedic corpus (ingest_pubmed.py)
+COLLECTION_FULLTEXT = "orthopedic_fulltext" # PMC open-access FULL-TEXT corpus (pmc.py / ingest_fulltext.py)
 # The ACTIVE collection that query.py and server.py read from — flip this to
 # switch the whole demo between the baseline and the orthopedic corpus.
 COLLECTION_NAME = COLLECTION_ORTHO
@@ -106,6 +107,15 @@ PUBMED_SUBTOPIC_TARGET = 3000   # max abstracts per subtopic (capped at the ~9,9
 # disk any number of times with no network. (Also the air-gap story: fetch once,
 # operate offline.) Ignored by git via .gitignore below if you add it there.
 CORPUS_CACHE = str(Path(__file__).parent / "ortho_corpus.jsonl")
+
+# --- Full text (PubMed Central Open Access subset) -------------------------
+# Abstracts come from PubMed; full text lives in PMC, but only the Open Access
+# subset is fetchable as machine-readable JATS XML (~half of recent ortho PMIDs).
+# Full text is ~50x longer than an abstract and carries the reference list — the
+# raw material for a citation graph. efetch is one call per article, so we cap the
+# number pulled for the demo. See pmc.py.
+FULLTEXT_CACHE = str(Path(__file__).parent / "ortho_fulltext.jsonl")
+FULLTEXT_TARGET = 1500   # max OA full-text articles to pull (each is one efetch call)
 
 # --- Retrieval -------------------------------------------------------------
 TOP_K = 5

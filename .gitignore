@@ -9,3 +9,4 @@ ortho_corpus.jsonl
 eval_results.json
 .claude/settings.local.json
 audit_log.jsonl
+ortho_fulltext.jsonl
