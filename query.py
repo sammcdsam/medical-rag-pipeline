@@ -28,13 +28,11 @@ def get_collection(name: str = config.COLLECTION_NAME):
 
 
 def _provenance(meta: dict) -> tuple[str, str]:
-    """Return (kind, id) for a chunk — PMID for the live-PubMed corpus, Wikipedia
-    for background articles, pubid for the PubMedQA baseline. Keeps
+    """Return (kind, id) for a chunk — PMID for the live-PubMed corpus, StatPearls
+    for background chapters, pubid for the PubMedQA baseline. Keeps
     query/eval/server corpus-agnostic."""
     if meta.get("pmid"):
         return "PMID", meta["pmid"]
-    if meta.get("pageid"):
-        return "Wikipedia", meta["pageid"]
     if meta.get("chapter_id"):
         return "StatPearls", meta["chapter_id"]
     return "pubid", str(meta.get("pubid", "?"))

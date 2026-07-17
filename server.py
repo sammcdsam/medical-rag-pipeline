@@ -849,8 +849,8 @@ function render(data) {
     // how a reader tells them apart at a glance.
     const st = ch.source_type
       ? `<span class="stype st-${ch.source_type}" title="${ch.source_type === 'reference'
-          ? 'Encyclopedic background (Wikipedia, CC BY-SA) — not peer-reviewed'
-          : 'Peer-reviewed research from PubMed'}">${ch.source_type}</span>` : '';
+          ? 'Peer-reviewed clinical reference (StatPearls) — background: indications, technique, complications'
+          : 'Peer-reviewed research paper from PubMed'}">${ch.source_type}</span>` : '';
     // Section heading (StatPearls chapters / full-text papers are section-chunked).
     const sec = ch.section ? `<span class="muted">§ ${escapeHtml(ch.section)}</span>` : '';
     return `<div class="chunk">

@@ -1,29 +1,30 @@
-"""Ingest the BACKGROUND corpora into the main index, tagged source_type=reference.
+"""Ingest the StatPearls BACKGROUND corpus, tagged source_type=reference.
 
-Two background sources, both tagged "reference" but distinguishable by `source`:
+The PubMed corpus is all RESEARCH: it reports what studies found, but nothing in
+it explains what a procedure IS. StatPearls is the missing layer — a
+peer-reviewed clinical reference, section-structured as exactly the background a
+clinician wants: Indications / Technique or Treatment / Complications.
 
-  - StatPearls  — PEER-REVIEWED clinical reference (statpearls.py). The good one:
-                  section-structured as Indications / Technique / Complications.
-  - Wikipedia   — encyclopedic fallback (wiki.py). Decent coverage, NOT peer
-                  reviewed; kept for breadth where StatPearls has no chapter.
-
-    python statpearls.py            # step 1a: extract chapters from the tarball
-    python wiki.py                  # step 1b: cache the Wikipedia articles
+    python statpearls.py            # step 1: extract chapters from the tarball
     python ingest_reference.py      # step 2: chunk -> embed -> Chroma (offline)
     python ingest_reference.py --stamp-research   # also tag existing PubMed chunks
-    python ingest_reference.py --only statpearls  # just one source
+
+Wikipedia briefly filled this role and was dropped once StatPearls landed: every
+source in the corpus is now peer-reviewed, which is the whole point on a medical
+corpus. (See git history for the wiki.py fetcher if that layer is ever wanted
+back for breadth.)
 
 Why the SAME collection as the papers rather than a separate one? Because the
 whole point is that one question should reach whichever source actually answers
-it: "what is a total knee arthroplasty?" should surface the background article,
+it: "what is a total knee arthroplasty?" should surface the reference chapter,
 "what's the DVT risk after one?" should surface the papers. Two collections would
 force the caller to decide which to search BEFORE knowing the answer — exactly
 the guess we want retrieval to make for us. The `source_type` tag keeps them
 distinguishable ("reference" vs "research") for labeling and filtering.
 
 Access labels are stamped at ingest (same scheme as the papers, keyed on the
-Wikipedia pageid instead of a PMID), so background chunks are access-controlled
-identically — a background article can't sneak past a clearance filter.
+chapter id instead of a PMID), so background chunks are access-controlled
+identically — a reference chapter can't sneak past a clearance filter.
 """
 import argparse
 
@@ -32,7 +33,6 @@ import chromadb
 import access
 import config
 import statpearls
-import wiki
 from embedder import embed_documents
 from ingest import chunk_text
 
@@ -63,28 +63,6 @@ def stamp_research(col) -> None:
         print(f"  {done}/{total}")
 
 
-def wiki_chunks(limit=None):
-    """Wikipedia articles -> (ids, texts, metadatas)."""
-    ids, texts, metas = [], [], []
-    for d in wiki.load_reference(limit=limit):
-        # Classification keys on a "wiki-<pageid>" string rather than the bare
-        # pageid: the id space is disjoint from PMIDs, so a page can't inherit a
-        # paper's level by numeric collision.
-        level = access.classify(f"wiki-{d['pageid']}")
-        for i, chunk in enumerate(chunk_text(d["text"])):
-            ids.append(f'wiki{d["pageid"]}-{i}')
-            texts.append(chunk)
-            metas.append({
-                "pageid": d["pageid"], "title": d["title"], "url": d["url"],
-                "chunk_index": i,
-                "source_type": "reference",          # vs "research" for PubMed
-                "source": "Wikipedia (CC BY-SA)",    # attribution the licence requires
-                "classification": level,
-                "compartment": d.get("compartment", "general"),
-            })
-    return ids, texts, metas
-
-
 def statpearls_chunks(limit=None):
     """StatPearls chapters -> (ids, texts, metadatas), chunked section-aware.
 
@@ -96,6 +74,9 @@ def statpearls_chunks(limit=None):
     ids, texts, metas = [], [], []
     for d in statpearls.load(limit=limit):
         cid = d["chapter_id"]
+        # Classification keys on a "statpearls-<id>" string rather than the bare
+        # id: that id space is disjoint from PMIDs, so a chapter can't inherit a
+        # paper's level by numeric collision.
         level = access.classify(f"statpearls-{cid}")
         for s_i, sec in enumerate(d["sections"]):
             for c_i, chunk in enumerate(chunk_text(sec["text"])):
@@ -114,26 +95,16 @@ def statpearls_chunks(limit=None):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Ingest the background reference corpora.")
-    ap.add_argument("--limit", type=int, default=None, help="Use only the first N documents per source.")
-    ap.add_argument("--only", choices=["statpearls", "wiki"], default=None,
-                    help="Ingest just one source (default: both).")
+    ap = argparse.ArgumentParser(description="Ingest the StatPearls background corpus.")
+    ap.add_argument("--limit", type=int, default=None, help="Use only the first N chapters.")
     ap.add_argument("--stamp-research", action="store_true",
                     help="Also tag existing PubMed chunks source_type='research'.")
     args = ap.parse_args()
 
-    ids, texts, metadatas = [], [], []
-    if args.only in (None, "statpearls"):
-        i, t, m = statpearls_chunks(args.limit)
-        print(f"StatPearls  -> {len(t):>6,} chunks")
-        ids += i; texts += t; metadatas += m
-    if args.only in (None, "wiki"):
-        i, t, m = wiki_chunks(args.limit)
-        print(f"Wikipedia   -> {len(t):>6,} chunks")
-        ids += i; texts += t; metadatas += m
+    ids, texts, metadatas = statpearls_chunks(args.limit)
     if not texts:
-        raise SystemExit("Nothing to ingest — run `python statpearls.py` / `python wiki.py` first.")
-    print(f"total       -> {len(texts):>6,} chunks")
+        raise SystemExit("Nothing to ingest — run `python statpearls.py` first.")
+    print(f"StatPearls -> {len(texts):,} chunks from {len(statpearls.load(args.limit)):,} chapters")
 
     client = chromadb.PersistentClient(path=config.CHROMA_DIR)
     col = client.get_or_create_collection(config.COLLECTION_ORTHO,

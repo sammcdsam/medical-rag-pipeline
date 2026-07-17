@@ -117,37 +117,15 @@ CORPUS_CACHE = str(Path(__file__).parent / "ortho_corpus.jsonl")
 FULLTEXT_CACHE = str(Path(__file__).parent / "ortho_fulltext.jsonl")
 FULLTEXT_TARGET = 1500   # max OA full-text articles to pull (each is one efetch call)
 
-# --- Background reference corpus (Wikipedia) -------------------------------
+# --- Background reference corpus (StatPearls) ------------------------------
 # PubMed gives us RESEARCH ("what did this study find?"); it has no BACKGROUND
-# ("what is a total knee arthroplasty?"). These categories add the missing layer:
-# procedures, anatomy, and conditions. Each chunk is tagged source_type=
-# "reference" (vs "research") so the UI can label it and retrieval can filter —
-# Wikipedia is not peer-reviewed and shouldn't be dressed up as if it were.
-# The compartment value maps each category onto the SAME need-to-know
-# compartments the PubMed corpus already uses (see access.py), so background
-# articles are access-controlled identically. See wiki.py.
-WIKI_CATEGORIES = {
-    "Orthopedic surgical procedures": "arthroplasty",
-    "Bone fractures": "trauma",
-    "Arthroplasty": "arthroplasty",
-    "Spinal cord disorders": "spine",
-    "Vertebral column": "spine",
-    "Knee surgery": "sports_knee",
-    "Shoulder surgery": "shoulder_elbow",
-    "Hand surgery": "hand_wrist",
-    "Foot and ankle surgery": "foot_ankle",
-    "Bone tumors": "oncology",
-    "Musculoskeletal disorders": "arthroplasty",
-    "Sports injuries": "sports_knee",
-}
-REFERENCE_CACHE = str(Path(__file__).parent / "ortho_reference.jsonl")
-REFERENCE_TARGET = 400   # background articles to cache
-
-# StatPearls — a PEER-REVIEWED clinical reference, the better background layer
-# (Wikipedia is the fallback: fine content, but not peer-reviewed). Chapters are
-# section-structured exactly like the background a clinician wants: Indications,
-# Technique, Complications. Sourced from NCBI's Literature Archive bulk tarball,
-# NOT PMC/efetch — see statpearls.py for the routes that don't work.
+# ("what is a total knee arthroplasty?"). StatPearls adds the missing layer, and
+# it's PEER-REVIEWED — so every source in the corpus is, which is the bar on a
+# medical corpus. Chapters are section-structured exactly like the background a
+# clinician wants: Indications, Technique, Complications. Each chunk is tagged
+# source_type="reference" (vs "research") so the UI can label it and retrieval
+# can filter. Sourced from NCBI's Literature Archive bulk tarball, NOT
+# PMC/efetch — see statpearls.py for the routes that don't work.
 # Licence CC BY-NC-ND 4.0: distribution of unaltered excerpts is permitted for
 # NON-COMMERCIAL use WITH CREDIT — every chunk carries the attribution string.
 STATPEARLS_CACHE = str(Path(__file__).parent / "ortho_statpearls.jsonl")
