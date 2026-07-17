@@ -117,6 +117,32 @@ CORPUS_CACHE = str(Path(__file__).parent / "ortho_corpus.jsonl")
 FULLTEXT_CACHE = str(Path(__file__).parent / "ortho_fulltext.jsonl")
 FULLTEXT_TARGET = 1500   # max OA full-text articles to pull (each is one efetch call)
 
+# --- Background reference corpus (Wikipedia) -------------------------------
+# PubMed gives us RESEARCH ("what did this study find?"); it has no BACKGROUND
+# ("what is a total knee arthroplasty?"). These categories add the missing layer:
+# procedures, anatomy, and conditions. Each chunk is tagged source_type=
+# "reference" (vs "research") so the UI can label it and retrieval can filter —
+# Wikipedia is not peer-reviewed and shouldn't be dressed up as if it were.
+# The compartment value maps each category onto the SAME need-to-know
+# compartments the PubMed corpus already uses (see access.py), so background
+# articles are access-controlled identically. See wiki.py.
+WIKI_CATEGORIES = {
+    "Orthopedic surgical procedures": "arthroplasty",
+    "Bone fractures": "trauma",
+    "Arthroplasty": "arthroplasty",
+    "Spinal cord disorders": "spine",
+    "Vertebral column": "spine",
+    "Knee surgery": "sports_knee",
+    "Shoulder surgery": "shoulder_elbow",
+    "Hand surgery": "hand_wrist",
+    "Foot and ankle surgery": "foot_ankle",
+    "Bone tumors": "oncology",
+    "Musculoskeletal disorders": "arthroplasty",
+    "Sports injuries": "sports_knee",
+}
+REFERENCE_CACHE = str(Path(__file__).parent / "ortho_reference.jsonl")
+REFERENCE_TARGET = 400   # background articles to cache
+
 # --- Retrieval -------------------------------------------------------------
 TOP_K = 5
 
@@ -134,7 +160,10 @@ RERANK_CANDIDATES = 30   # first-stage pool the reranker narrows down to TOP_K
 CLAUDE_MODEL = "claude-haiku-4-5"   # cheap + fast; good enough for grounded Q&A
 MAX_TOKENS = 1024
 # Local model for the air-gap / offline path — runs on the GPU via Ollama, $0,
-# no internet. Swap for any pulled model (e.g. "qwen3.5:35b-a3b" for higher
-# quality on this 3090). The whole point: identical RAG pipeline, no API needed.
-LOCAL_MODEL = "llama3.1:8b"
+# no internet. The whole point: identical RAG pipeline, no API needed.
+# A 35B mixture-of-experts with ~3B active params: fits the 3090's 24GB and runs
+# near 8B speed while following the "cite [n], don't invent" instruction far
+# better than llama3.1:8b did — which is the job here, since RAG hands the model
+# its facts. Swap for any pulled model (`ollama list`).
+LOCAL_MODEL = "mistral-small:24b"
 OLLAMA_URL = "http://localhost:11434"

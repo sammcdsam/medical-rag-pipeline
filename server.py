@@ -300,6 +300,11 @@ def api_query(q: Query, request: Request, response: Response):
             "classification": access.LEVEL_NAME.get(m.get("classification")) if "classification" in m else None,
             "compartment": m.get("compartment"),
             "silo": federated.SILOS[m["silo"]]["label"] if m.get("silo") else None,
+            # "reference" = encyclopedic background, "research" = a PubMed paper.
+            # Surfaced so a reader can weigh them differently — background is not
+            # peer-reviewed and shouldn't look like it is.
+            "source_type": m.get("source_type"),
+            "url": m.get("url"),
             "text": t,
         })
     result = {
@@ -582,6 +587,10 @@ HTML = """<!doctype html>
   .cls-CONFIDENTIAL { background: #2e2a12; color: #d0b23a; border: 1px solid #52481c; }
   .cls-SECRET { background: #33230f; color: #e0913a; border: 1px solid #5a3d18; }
   .cls-TOP_SECRET { background: #3a1620; color: #f0637e; border: 1px solid #5e2233; }
+  /* Source-type tag: background reference vs peer-reviewed research. */
+  .stype { font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; letter-spacing: .03em; }
+  .st-reference { background: #14263a; color: #6cb6ff; border: 1px solid #1f4468; }
+  .st-research { background: #221b33; color: #b083f0; border: 1px solid #3b2d5c; }
   /* Public demo mode: the write-up nav and the model picker don't exist for
      visitors (the server enforces this too — hiding is just honest UI). */
   body.public .nav, body.public #backendBox { display: none; }
@@ -831,11 +840,17 @@ function render(data) {
       ? `<span class="clsbadge cls-${ch.classification}">${ch.classification}</span>` : '';
     const comp = ch.compartment ? `<span>${escapeHtml(ch.compartment)}</span>` : '';
     const silo = ch.silo ? `<span title="source silo">⛁ ${escapeHtml(ch.silo)}</span>` : '';
+    // Background articles and peer-reviewed papers live in one index; the tag is
+    // how a reader tells them apart at a glance.
+    const st = ch.source_type
+      ? `<span class="stype st-${ch.source_type}" title="${ch.source_type === 'reference'
+          ? 'Encyclopedic background (Wikipedia, CC BY-SA) — not peer-reviewed'
+          : 'Peer-reviewed research from PubMed'}">${ch.source_type}</span>` : '';
     return `<div class="chunk">
       <div class="meta">
         <span>#${ch.rank}</span>
         <span>${escapeHtml(ch.source)}</span>
-        ${cls}${comp}${silo}
+        ${st}${cls}${comp}${silo}
         <span>dist ${ch.distance.toFixed(3)}</span>
         <span class="simbar"><span style="width:${(sim*100).toFixed(0)}%"></span></span>
       </div>

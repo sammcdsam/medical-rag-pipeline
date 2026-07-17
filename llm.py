@@ -51,10 +51,17 @@ def _local(question: str, hits) -> dict:
     context = "\n\n".join(
         f"[{i}] (PMID {m.get('pmid', '?')}) {t}" for i, (t, m, _d) in enumerate(hits)
     )
+    # Prompt note: the earlier wording ended "If the sources do not contain the
+    # answer, say so plainly." llama3.1 ignored it, but instruction-following
+    # models take it literally and open with a paragraph hedging about the
+    # sources' limitations before answering. Abstention is still wanted — it's a
+    # safety property on a medical corpus — so it's kept, but narrowed to the
+    # case where the sources genuinely don't address the question.
     prompt = (
         "You are a careful clinical assistant. Answer the question using ONLY the "
-        "numbered sources below, and cite the ones you use as [n]. If the sources "
-        "do not contain the answer, say so plainly.\n\n"
+        "numbered sources below, citing each claim as [n]. Report what the sources "
+        "DO establish, directly and without preamble about their limitations. Only "
+        "if the sources genuinely do not address the question at all, say so plainly.\n\n"
         f"Sources:\n{context}\n\nQuestion: {question}\n\nAnswer:"
     )
     body = json.dumps({

@@ -12,3 +12,4 @@ audit_log.jsonl
 ortho_fulltext.jsonl
 private_interview.py
 .claude/settings.local.json.tmp.*
+ortho_reference.jsonl
