@@ -31,8 +31,12 @@ CLEARANCE = {"UNCLASSIFIED": 0, "CONFIDENTIAL": 1, "SECRET": 2, "TOP_SECRET": 3}
 LEVEL_NAME = {v: k for k, v in CLEARANCE.items()}
 MAX_LEVEL = max(CLEARANCE.values())
 
-# The orthopedic subtopics double as need-to-know compartments.
-COMPARTMENTS = list(config.PUBMED_SUBTOPICS.keys())
+# The orthopedic subtopics double as need-to-know compartments. "anatomy" is an
+# extra compartment for the general anatomy reference chapters (StatPearls), which
+# aren't tied to one subtopic. It's part of the universe so that a user holding
+# "all compartments" (or all-but-a-few, like the clinician) is granted it — the
+# build_where $in filter would otherwise silently drop every anatomy chunk.
+COMPARTMENTS = list(config.PUBMED_SUBTOPICS.keys()) + ["anatomy"]
 ALL_COMPARTMENTS = set(COMPARTMENTS)
 
 

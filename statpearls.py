@@ -36,11 +36,14 @@ import config
 
 ATTRIBUTION = "StatPearls Publishing (CC BY-NC-ND 4.0)"
 
-# Chapter selection. StatPearls covers all of medicine (9,640 chapters); we want
-# the orthopedic ones. Matching on the TITLE only — not the body — because a
-# cardiology chapter can mention "fracture" in passing, and body matching drags
-# in most of the book. Each pattern maps onto the same need-to-know compartments
-# the PubMed corpus uses (access.py), so background is access-controlled the same.
+# Chapter selection. StatPearls covers all of medicine (9,640 chapters); we keep
+# the orthopedic clinical chapters PLUS all anatomy chapters (anatomy is
+# foundational background for orthopedics — the "what is this structure" layer).
+# Matching on the TITLE only — not the body — because a cardiology chapter can
+# mention "fracture" in passing, and body matching drags in most of the book.
+# Each pattern maps onto the same need-to-know compartments the PubMed corpus
+# uses (access.py), so background is access-controlled the same; general anatomy
+# lands in a dedicated "anatomy" compartment.
 ORTHO_PATTERNS = [
     (r"\b(arthroplasty|joint replacement|arthrodesis)", "arthroplasty"),
     (r"\b(fracture|dislocation|nonunion|malunion|orthopedic trauma|internal fixation)", "trauma"),
@@ -83,14 +86,33 @@ def _txt(el) -> str:
 
 
 def classify_title(title: str) -> str | None:
-    """Which compartment does this chapter belong to — or None if not orthopedic.
+    """Which compartment does this chapter belong to — or None if out of scope.
 
-    Veto first, then match: an excluded region wins over any injury keyword, so
-    "Maxillary Sinus Fracture" is dropped rather than filed under trauma.
+    Two ways in:
+      1. Orthopedic clinical chapters — matched by ORTHO_PATTERNS, with the region
+         veto applied first so "Maxillary Sinus Fracture" is dropped, not filed
+         under trauma.
+      2. ANATOMY chapters — kept wholesale (the user wants all anatomy as
+         orthopedic-supporting background). The region veto does NOT apply here:
+         "Anatomy, Head and Neck, Larynx" is legitimate anatomy, just not
+         musculoskeletal. A musculoskeletal anatomy chapter is filed under its
+         ortho region; the rest go to a general `anatomy` compartment.
     """
+    t = title.lower()
+
+    # (2) Anatomy chapters — StatPearls titles them "Anatomy, <region>, <part>".
+    if re.match(r"anatomy\b", t):
+        for pattern, compartment in ORTHO_PATTERNS:
+            # Reuse the region keywords, but skip the "arthroplasty" catch-all
+            # rows (osteo*/arthr*) — they'd sweep unrelated anatomy in. Only the
+            # concrete body-part rows should re-file anatomy onto an ortho region.
+            if compartment != "arthroplasty" and re.search(pattern, t):
+                return compartment
+        return "anatomy"
+
+    # (1) Orthopedic clinical chapters.
     if _excluded(title):
         return None
-    t = title.lower()
     for pattern, compartment in ORTHO_PATTERNS:
         if re.search(pattern, t):
             return compartment
