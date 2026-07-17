@@ -23,16 +23,23 @@ import query
 BACKENDS = ("claude", "local")
 
 
-def generate(question: str, hits, backend: str = "claude") -> dict:
-    """Route to the chosen backend and return a normalized result dict."""
+def generate(question: str, hits, backend: str = "claude", model: str | None = None) -> dict:
+    """Route to the chosen backend and return a normalized result dict.
+
+    `model` overrides the configured model for that backend — which is what lets
+    the eval harness A/B two local models on the SAME questions and retrieval
+    (see eval_ortho.py --answer-backend/--answer-model). Default None keeps
+    config.LOCAL_MODEL / config.CLAUDE_MODEL.
+    """
     if backend == "local":
-        return _local(question, hits)
-    return _claude(question, hits)
+        return _local(question, hits, model=model)
+    return _claude(question, hits, model=model)
 
 
-def _claude(question: str, hits) -> dict:
+def _claude(question: str, hits, model: str | None = None) -> dict:
     """Frontier path: Claude with native document-block citations."""
-    resp = query.answer(question, hits)
+    model = model or config.CLAUDE_MODEL
+    resp = query.answer(question, hits, model=model)
     text_parts, cites = [], []
     for block in resp.content:
         if block.type != "text":
@@ -41,13 +48,14 @@ def _claude(question: str, hits) -> dict:
         for c in block.citations or []:
             cites.append({"title": c.document_title, "text": c.cited_text.strip()})
     return {"answer": "".join(text_parts), "citations": cites,
-            "model": config.CLAUDE_MODEL, "backend": "claude"}
+            "model": model, "backend": "claude"}
 
 
-def _local(question: str, hits) -> dict:
+def _local(question: str, hits, model: str | None = None) -> dict:
     """Air-gap path: a local Ollama model. No native-citation API, so we number
     the sources and ask the model to cite [n]; the retrieved chunks (with PMIDs)
     are surfaced separately as the evidence."""
+    model = model or config.LOCAL_MODEL
     context = "\n\n".join(
         f"[{i}] (PMID {m.get('pmid', '?')}) {t}" for i, (t, m, _d) in enumerate(hits)
     )
@@ -65,7 +73,7 @@ def _local(question: str, hits) -> dict:
         f"Sources:\n{context}\n\nQuestion: {question}\n\nAnswer:"
     )
     body = json.dumps({
-        "model": config.LOCAL_MODEL,
+        "model": model,
         "prompt": prompt,
         "stream": False,
         "options": {"temperature": 0.2, "num_predict": config.MAX_TOKENS},
@@ -77,4 +85,4 @@ def _local(question: str, hits) -> dict:
     with urllib.request.urlopen(req, timeout=180) as r:
         out = json.loads(r.read())
     return {"answer": out.get("response", "").strip(), "citations": [],
-            "model": config.LOCAL_MODEL, "backend": "local"}
+            "model": model, "backend": "local"}

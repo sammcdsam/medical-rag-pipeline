@@ -203,11 +203,17 @@ def _metrics(ranks: list[int]) -> dict:
     return {"hit_at_k": round(hits / n, 3), "mrr": round(rr / n, 3)}
 
 
-def _faithfulness(client, q: str, results) -> int:
-    """Full RAG answer over `results`, then LLM-judge % grounded."""
-    from query import answer as rag_answer
-    resp = rag_answer(q, results)
-    ans = "".join(b.text for b in resp.content if b.type == "text")
+def _faithfulness(client, q: str, results, backend: str = "claude",
+                  model: str | None = None) -> int:
+    """Full RAG answer over `results`, then LLM-judge % grounded.
+
+    The ANSWER can come from any backend (Claude, or a local Ollama model —
+    that's the point: it's how you measure whether a local model earns its place
+    on the air-gap path). The JUDGE is always Claude: grading grounding is the
+    harder task, and judging a model's output with itself would flatter it.
+    """
+    import llm
+    ans = llm.generate(q, results, backend=backend, model=model)["answer"]
     ctx = "\n\n".join(t for t, _m, _d in results)
     return judge_faithfulness(client, q, ctx, ans)
 
@@ -260,8 +266,54 @@ def run_compare(collection, client, samples, k: int, hard: bool,
     return out
 
 
+def run_compare_models(collection, client, samples, k: int, hard: bool, rerank: bool,
+                       models: list[str], backend: str = "local") -> dict:
+    """PAIRED A/B across ANSWER MODELS: same questions, same retrieved context.
+
+    Why paired, in one process: generate_question() calls Claude at default
+    temperature, so two separate runs get two different question sets — and a
+    faithfulness gap between them would be question-sampling noise, not the
+    model. (That's the exact error the early unpaired reranker eval made, which
+    reversed once it was paired.) Here every model answers the IDENTICAL
+    questions over the IDENTICAL retrieved chunks, so any delta is the model.
+
+    The judge is Claude for all of them — one fixed yardstick.
+    """
+    # Guard against the silent-mislabel trap: an ollama tag ("llama3.1:8b") sent
+    # to the claude backend used to run Claude and *label the column* with the
+    # ollama name — producing a confident Claude-vs-Claude comparison. Fail loudly.
+    if backend == "claude" and any(":" in m and not m.startswith("claude") for m in models):
+        raise SystemExit(
+            f"--compare-models {models} looks like local model tags but "
+            "--answer-backend is 'claude'. Pass --answer-backend local, or the run "
+            "would compare Claude with itself and label the columns with these names."
+        )
+    print(f"PAIRED model comparison (backend={backend}): {', '.join(models)}")
+    print("Same questions, same retrieval — only the answering model changes.\n")
+    scores = {m: [] for m in models}
+    for i, s in enumerate(samples):
+        q = generate_question(client, s["text"], hard=hard)
+        results = retrieve(collection, q, k=k, rerank=rerank)   # retrieve ONCE
+        row = []
+        for m in models:
+            sc = _faithfulness(client, q, results, backend, m)
+            scores[m].append(sc)
+            row.append(f"{m.split(':')[0][:12]}={sc:>3}")
+        print(f"{i:>3}  {'  '.join(row)}  {q[:44]}")
+
+    out = {}
+    for m, vals in scores.items():
+        mean = sum(vals) / len(vals)
+        # Report the spread too: an LLM judge on n=30 is noisy, and a 2-point
+        # gap inside a 30-point spread is not a finding.
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        out[m] = {"faithfulness": round(mean, 1), "stdev": round(var ** 0.5, 1), "n": len(vals)}
+    return out
+
+
 def run_single(collection, client, samples, k: int, hard: bool, rerank: bool,
-               faithfulness: bool, relevance: bool = False) -> dict:
+               faithfulness: bool, relevance: bool = False,
+               answer_backend: str = "claude", answer_model: str | None = None) -> dict:
     """Single-config eval (one retrieval setting), optional faithfulness/relevance."""
     print(f"{'#':>3}  {'hit':>3}  {'rank':>4}  question")
     print("-" * 80)
@@ -273,7 +325,7 @@ def run_single(collection, client, samples, k: int, hard: bool, rerank: bool,
         ranks.append(rank)
 
         if faithfulness:
-            faith_scores.append(_faithfulness(client, q, results))
+            faith_scores.append(_faithfulness(client, q, results, answer_backend, answer_model))
         if relevance:
             grade_lists.append(judge_relevance(client, q, results))
 
@@ -300,6 +352,14 @@ def main() -> None:
                         help="Add the cross-encoder rerank stage to retrieval (see reranker.py).")
     parser.add_argument("--compare", action="store_true",
                         help="Paired A/B: evaluate the SAME questions with and without rerank (isolates its effect).")
+    parser.add_argument("--answer-backend", choices=["claude", "local"], default="claude",
+                        help="Which backend WRITES the answers judged by --faithfulness (judge is always Claude).")
+    parser.add_argument("--answer-model", default=None,
+                        help="Override the model for --answer-backend, e.g. 'llama3.1:8b'.")
+    parser.add_argument("--compare-models", default=None,
+                        help="Paired A/B of answer models on IDENTICAL questions+retrieval, "
+                             "judged for faithfulness. Comma-separated, e.g. "
+                             "'llama3.1:8b,mistral-small:24b'.")
     args = parser.parse_args()
 
     collection = get_collection(config.COLLECTION_ORTHO)
@@ -316,14 +376,28 @@ def main() -> None:
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "corpus": config.COLLECTION_ORTHO,
         "corpus_chunks": collection.count(),
-        "model": config.CLAUDE_MODEL,
+        "model": config.CLAUDE_MODEL,          # the JUDGE / question generator
         "embedder": config.EMBED_MODEL,
         "n": n,
         "k": args.k,
         "question_mode": "hard" if args.hard else "easy",
+        # Which model actually WROTE the answers being judged for grounding.
+        "answer_backend": args.answer_backend,
+        "answer_model": args.answer_model or (
+            config.LOCAL_MODEL if args.answer_backend == "local" else config.CLAUDE_MODEL),
     }
 
-    if args.compare:
+    if args.compare_models:
+        models = [m.strip() for m in args.compare_models.split(",") if m.strip()]
+        mm = run_compare_models(collection, client, samples, args.k, args.hard,
+                                args.rerank, models, args.answer_backend)
+        summary["compare_models"] = mm
+        summary["rerank"] = args.rerank
+        print("-" * 80)
+        print(f"{'answer model':>24}{'faithfulness':>14}{'stdev':>8}")
+        for m, v in mm.items():
+            print(f"{m:>24}{v['faithfulness']:>13.1f}%{v['stdev']:>8.1f}")
+    elif args.compare:
         ab = run_compare(collection, client, samples, args.k, args.hard, args.faithfulness, args.relevance)
         summary["compare"] = ab
         print("-" * 80)
@@ -337,7 +411,8 @@ def main() -> None:
             print(f"{'Faithfulness':>22}{ab['off']['faithfulness']:>11.1f}%{ab['on']['faithfulness']:>11.1f}%")
     else:
         m = run_single(collection, client, samples, args.k, args.hard, args.rerank,
-                       args.faithfulness, args.relevance)
+                       args.faithfulness, args.relevance,
+                       args.answer_backend, args.answer_model)
         summary.update({"rerank": args.rerank, **m})
         print("-" * 80)
         print(f"Hit@{args.k}   (source abstract in top-{args.k}): {m['hit_at_k']:.0%}")

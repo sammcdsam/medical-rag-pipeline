@@ -103,7 +103,7 @@ def build_document_blocks(hits) -> list[dict]:
     return blocks
 
 
-def answer(question: str, hits):
+def answer(question: str, hits, model: str | None = None):
     client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 
     # Content order: all the source documents first, then the question/instruction.
@@ -120,7 +120,7 @@ def answer(question: str, hits):
     ]
 
     return client.messages.create(
-        model=config.CLAUDE_MODEL,
+        model=model or config.CLAUDE_MODEL,
         max_tokens=config.MAX_TOKENS,
         messages=[{"role": "user", "content": content}],
     )

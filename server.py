@@ -39,6 +39,7 @@ import audit
 import config
 import federated
 import llm
+import statpearls
 from query import get_collection, retrieve, answer, _provenance
 
 app = FastAPI(title="Minimal RAG demo")
@@ -406,9 +407,36 @@ def api_eval(request: Request):
     return {}
 
 
+_layer_cache: dict = {}
+
+
+def corpus_layers(col):
+    """Count chunks per source layer (research vs reference) straight from the index.
+
+    Paging the whole collection takes a couple of seconds, so the result is
+    memoised against the chunk count — it only recomputes after an ingest.
+    (A single full .get() would trip Chroma's SQL-variable limit at this size,
+    hence the paging.)
+    """
+    total = col.count()
+    if _layer_cache.get("total") == total:
+        return _layer_cache["layers"]
+    layers, done = {}, 0
+    while done < total:
+        got = col.get(limit=5000, offset=done, include=["metadatas"])
+        if not got["ids"]:
+            break
+        for m in got["metadatas"]:
+            key = (m or {}).get("source") or "PubMed abstracts"
+            layers[key] = layers.get(key, 0) + 1
+        done += len(got["ids"])
+    _layer_cache.update(total=total, layers=layers)
+    return layers
+
+
 @app.get("/api/corpus")
 def api_corpus(request: Request):
-    """Descriptive stats about the corpus, from the local cache + the index."""
+    """Descriptive stats about the corpus, from the local caches + the index."""
     _private(request)
     import statistics
 
@@ -435,9 +463,29 @@ def api_corpus(request: Request):
 
     n = len(words)
     try:
-        chunks = collection().count()
+        col = collection()
+        chunks = col.count()
+        layers = corpus_layers(col)
     except Exception:
-        chunks = 0
+        chunks, layers = 0, {}
+
+    # chunks_per_abstract must divide by the RESEARCH chunks only. Dividing the
+    # whole index by the abstract count silently became nonsense the moment a
+    # second source (StatPearls) landed — those chunks came from no abstract.
+    research_chunks = layers.get("PubMed abstracts", 0)
+    reference_chunks = sum(v for k, v in layers.items() if k != "PubMed abstracts")
+
+    # StatPearls (the reference layer) — read from its cache, same as the
+    # abstracts above, so the page describes what was actually ingested.
+    chapters, sp_compartments, sp_sections = 0, {}, {}
+    sp_docs = statpearls.load()
+    for d in sp_docs:
+        chapters += 1
+        c = d.get("compartment", "general")
+        sp_compartments[c] = sp_compartments.get(c, 0) + 1
+        for s in d["sections"]:
+            h = s["heading"]
+            sp_sections[h] = sp_sections.get(h, 0) + 1
 
     numeric_years = sorted(int(y) for y in years if y.isdigit())
     year_hist = sorted(((y, c) for y, c in years.items() if y.isdigit()),
@@ -449,7 +497,20 @@ def api_corpus(request: Request):
         "cache_file": os.path.basename(config.CORPUS_CACHE),
         "abstracts": n,
         "chunks": chunks,
-        "chunks_per_abstract": round(chunks / n, 2) if n else 0,
+        "chunks_per_abstract": round(research_chunks / n, 2) if n else 0,
+        # The two source layers the index is built from.
+        "layers": [{"name": k, "chunks": v} for k, v in
+                   sorted(layers.items(), key=lambda x: -x[1])],
+        "research_chunks": research_chunks,
+        "reference_chunks": reference_chunks,
+        "reference": {
+            "chapters": chapters,
+            "words": sum(len(s["text"].split()) for d in sp_docs for s in d["sections"]),
+            "compartments": sorted(sp_compartments.items(), key=lambda x: -x[1]),
+            "sections": sorted(sp_sections.items(), key=lambda x: -x[1])[:12],
+            "attribution": statpearls.ATTRIBUTION,
+            "samples": [{"title": d["title"], "compartment": d["compartment"]} for d in sp_docs[:8]],
+        },
         "distinct_journals": len(journals),
         "year_min": numeric_years[0] if numeric_years else None,
         "year_max": numeric_years[-1] if numeric_years else None,
@@ -1084,6 +1145,37 @@ fetch('/api/eval').then(r => r.json()).then(d => {
   }
   const pct = x => (x * 100).toFixed(0) + '%';
   const mode = d.question_mode === 'hard' ? 'hard (paraphrased)' : 'easy (specific)';
+
+  // Paired ANSWER-MODEL comparison (--compare-models): same questions, same
+  // retrieved context, only the generating model changes; Claude always judges.
+  if (d.compare_models) {
+    const rows = Object.entries(d.compare_models)
+      .sort((a, b) => b[1].faithfulness - a[1].faithfulness)
+      .map(([m, v]) =>
+        `<tr><td><code>${m}</code></td><td>${v.faithfulness.toFixed(1)}%</td>`
+        + `<td>${v.stdev.toFixed(1)}</td><td>${v.n}</td></tr>`).join('');
+    const vals = Object.values(d.compare_models).map(v => v.faithfulness);
+    const spread = (Math.max(...vals) - Math.min(...vals)).toFixed(1);
+    // Standard error of the mean — the honest bar a gap has to clear.
+    const ses = Object.values(d.compare_models).map(v => v.stdev / Math.sqrt(v.n));
+    const bar = (Math.max(...ses) * 2).toFixed(1);
+    el.innerHTML =
+      `<p style="margin-top:0">Which <b>local</b> model should the air-gap path use? Paired A/B:
+       every model answers the <b>same</b> questions over the <b>same</b> retrieved chunks, so a
+       gap is the model and not question-sampling noise. Claude judges all of them — one fixed yardstick.</p>`
+      + `<div class="tablewrap"><table style="min-width:auto">`
+      + `<thead><tr><th>answer model</th><th>faithfulness</th><th>stdev</th><th>n</th></tr></thead>`
+      + `<tbody>${rows}</tbody></table></div>`
+      + `<p class="note" style="margin-top:14px"><b>Read the spread before the ranking.</b> The gap here is
+         <b>${spread} points</b>; two standard errors is about <b>±${bar}</b>. A difference smaller than that
+         is noise, not a finding — an LLM judge over ${d.n} questions simply cannot resolve it. The useful
+         signal in this table is often the <b>stdev</b>: a model with a fat left tail produces the occasional
+         badly-grounded answer, which matters more on a medical corpus than a point of mean.</p>`
+      + `<div class="stamp">corpus <code>${d.corpus}</code> · ${d.corpus_chunks.toLocaleString()} chunks · `
+      + `${d.n} questions · top-${d.k} · question mode: <b>${mode}</b> · backend `
+      + `<b>${d.answer_backend}</b> · judge ${d.model} · ${d.generated_at}</div>`;
+    return;
+  }
   const stamp = `<div class="stamp">corpus <code>${d.corpus}</code> · ${d.corpus_chunks.toLocaleString()} chunks · `
     + `${d.n} questions · top-${d.k} · question mode: <b>${mode}</b> · judge ${d.model} · ${d.generated_at}</div>`;
 
@@ -1166,12 +1258,22 @@ CORPUS_HTML = """<!doctype html>
   .tile .v { font-size: 26px; font-weight: 700; color: #cfe0f3; }
   .tile .l { font-size: 12px; color: #7d8fa3; text-transform: uppercase; letter-spacing: .05em; }
   .card { background: #131a22; border: 1px solid #232b36; border-radius: 10px; padding: 16px 18px; }
-  .bar { display: grid; grid-template-columns: 90px 1fr 54px; align-items: center; gap: 10px; margin: 5px 0; font-size: 13px; }
+  /* One bar-chart shape for every chart on this page: label | track | count.
+     The label column was 90px, which ellipsed "shoulder_elbow" and every real
+     journal name; journals used a different 2-row grid entirely, so the three
+     charts didn't line up. min-content on the count keeps digits from wrapping. */
+  .bar { display: grid; grid-template-columns: 190px 1fr minmax(54px, min-content);
+         align-items: center; gap: 12px; margin: 6px 0; font-size: 13px; }
   .bar .lab { color: #9fb2c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bar .track { background: #0e1116; border-radius: 4px; height: 16px; overflow: hidden; }
-  .bar .fill { height: 100%; background: #2f81f7; }
+  .bar .fill { height: 100%; background: #2f81f7; border-radius: 4px; }
+  .bar .fill.ref { background: #6cb6ff; }   /* reference layer, matching the demo page's tag */
   .bar .n { text-align: right; color: #7d8fa3; font-variant-numeric: tabular-nums; }
-  .jbar { grid-template-columns: 1fr 44px; }
+  /* Journal names are long; give them more room but keep the same shape. */
+  .jbar { grid-template-columns: 300px 1fr minmax(54px, min-content); }
+  @media (max-width: 720px) {
+    .bar, .jbar { grid-template-columns: 120px 1fr minmax(44px, min-content); gap: 8px; }
+  }
   code { background: #1b2430; padding: 1px 6px; border-radius: 5px; font-size: 13px; color: #cfe0f3; }
   pre { background: #0b0f14; border: 1px solid #232b36; border-radius: 8px; padding: 12px 14px; overflow-x: auto;
         font-size: 13px; color: #c3d0de; white-space: pre-wrap; }
@@ -1206,60 +1308,113 @@ fetch('/api/corpus').then(r => r.json()).then(d => {
   }
   const tile = (v, l) => `<div class="tile"><div class="v">${v}</div><div class="l">${l}</div></div>`;
   const num = x => x.toLocaleString();
+  // One bar renderer for every chart on the page — they used to be three
+  // hand-written variants that drifted apart.
+  const bar = (label, count, max, cls = '', ref = false) =>
+    `<div class="bar ${cls}"><span class="lab" title="${esc(label)}">${esc(label)}</span>
+      <span class="track"><span class="fill${ref ? ' ref' : ''}" style="width:${(count / max * 100).toFixed(1)}%"></span></span>
+      <span class="n">${num(count)}</span></div>`;
 
   // stat tiles
-  let html = `<p>A knowledge base built from <b>live PubMed</b> abstracts, sorted by publication date — so it reflects the most recent orthopedic literature.</p>`;
+  const ref = d.reference || {};
+  let html = `<p>A knowledge base with two peer-reviewed layers: <b>live PubMed</b> abstracts
+    (the evidence) and <b>StatPearls</b> clinical reference chapters (the background).
+    Abstracts are pulled sorted by publication date, so the literature side reflects the
+    most recent orthopedic research.</p>`;
   html += '<div class="tiles">' +
-    tile(num(d.abstracts), 'abstracts') +
-    tile(num(d.chunks), 'chunks') +
-    tile(d.chunks_per_abstract, 'chunks / abstract') +
-    tile(num(d.words.median), 'median words') +
+    tile(num(d.chunks), 'chunks indexed') +
+    tile(num(d.abstracts), 'research papers') +
+    tile(num(ref.chapters || 0), 'reference chapters') +
+    tile(d.chunks_per_abstract, 'chunks / paper') +
     tile(num(d.distinct_journals), 'journals') +
     tile((d.year_min && d.year_max) ? (d.year_min + '–' + d.year_max) : '—', 'year span') +
     '</div>';
 
+  // Two source layers: what the index is actually built from.
+  if (d.layers && d.layers.length) {
+    const lmax = Math.max(...d.layers.map(x => x.chunks), 1);
+    html += '<h2>Source layers</h2>'
+      + '<p>Two kinds of source, one index — retrieval picks whichever is closer to the '
+      + 'question, with no routing logic. <b>Research</b> answers "what does the evidence show?"; '
+      + '<b>reference</b> answers "what is this and how is it done?". Every source is peer-reviewed.</p>'
+      + '<div class="card">'
+      + d.layers.map(l => bar(l.name, l.chunks, lmax, '', l.name !== 'PubMed abstracts'))
+          .join('')
+      + '</div>';
+  }
+
   // subtopic composition (the diversity view)
   if (d.subtopics && d.subtopics.length) {
     const smax = Math.max(...d.subtopics.map(x => x[1]), 1);
-    html += '<h2>Subtopic composition</h2><div class="card">' +
-      d.subtopics.map(([s, c]) =>
-        `<div class="bar"><span class="lab">${esc(s)}</span>
-          <span class="track"><span class="fill" style="width:${(c/smax*100).toFixed(1)}%"></span></span>
-          <span class="n">${num(c)}</span></div>`).join('') +
+    html += '<h2>Subtopic composition — research papers</h2><div class="card">' +
+      d.subtopics.map(([s, c]) => bar(s, c, smax)).join('') +
       '</div>';
   }
 
   // year distribution
   const ymax = Math.max(...d.year_hist.map(x => x[1]), 1);
-  html += '<h2>Publication years</h2><div class="card">' +
-    d.year_hist.map(([y, c]) =>
-      `<div class="bar"><span class="lab">${y}</span>
-        <span class="track"><span class="fill" style="width:${(c/ymax*100).toFixed(1)}%"></span></span>
-        <span class="n">${num(c)}</span></div>`).join('') +
+  html += '<h2>Publication years — research papers</h2><div class="card">' +
+    d.year_hist.map(([y, c]) => bar(y, c, ymax)).join('') +
     '</div>';
 
-  // top journals
+  // top journals — same bar shape as the charts above (it used to be a
+  // two-row grid of its own, which made the page look like three different charts)
   const jmax = Math.max(...d.top_journals.map(x => x[1]), 1);
   html += '<h2>Top journals</h2><div class="card">' +
-    d.top_journals.map(([j, c]) =>
-      `<div class="bar jbar"><span class="lab" title="${esc(j)}">${esc(j)}</span>
-        <span class="n">${num(c)}</span>
-        <span class="track" style="grid-column:1/3;margin-top:2px"><span class="fill" style="width:${(c/jmax*100).toFixed(1)}%"></span></span></div>`).join('') +
+    d.top_journals.map(([j, c]) => bar(j, c, jmax, 'jbar')).join('') +
     '</div>';
 
   // abstract length
-  html += '<h2>Abstract length (words)</h2><div class="tiles">' +
+  html += '<h2>Abstract length (words) — research papers</h2><div class="tiles">' +
     tile(num(d.words.min), 'min') + tile(num(d.words.median), 'median') +
     tile(num(d.words.mean), 'mean') + tile(num(d.words.max), 'max') + '</div>';
 
+  // ---- the reference layer ----
+  if (ref.chapters) {
+    html += `<h2>Reference layer — StatPearls</h2>
+      <p>A research corpus reports what studies <i>found</i>; nothing in it explains what a
+      procedure <b>is</b>. That was a gap in the corpus, not a retrieval bug: "what is a total
+      knee arthroplasty?" returned papers that assume you already know. StatPearls fills it —
+      peer-reviewed chapters structured as <b>Indications</b>, <b>Technique</b>,
+      <b>Complications</b>. Chunks never cross a section boundary, so a chunk answers one
+      question rather than straddling two.</p>`;
+    html += '<div class="tiles">' +
+      tile(num(ref.chapters), 'chapters') +
+      tile(num(d.reference_chunks), 'chunks') +
+      tile(num(Math.round(ref.words / 1000)) + 'k', 'words') +
+      tile(ref.compartments.length, 'compartments') + '</div>';
+
+    const cmax = Math.max(...ref.compartments.map(x => x[1]), 1);
+    html += '<h2>Reference chapters by compartment</h2><div class="card">' +
+      ref.compartments.map(([c, n]) => bar(c, n, cmax, '', true)).join('') + '</div>';
+
+    const secmax = Math.max(...ref.sections.map(x => x[1]), 1);
+    html += '<h2>Most common chapter sections</h2>'
+      + '<p>The shape of the background layer — this is what a clinical reference covers that a paper does not.</p>'
+      + '<div class="card">'
+      + ref.sections.map(([s, n]) => bar(s, n, secmax, 'jbar', true)).join('') + '</div>';
+
+    html += '<h2>Sample reference chapters</h2><div class="tablewrap"><table style="min-width:auto">' +
+      '<thead><tr><th>Chapter</th><th>Compartment</th></tr></thead><tbody>' +
+      ref.samples.map(s => `<tr><td>${esc(s.title)}</td><td>${esc(s.compartment)}</td></tr>`).join('') +
+      '</tbody></table></div>';
+    html += `<p class="muted" style="font-size:12.5px">${esc(ref.attribution)} — distributed under
+      CC BY-NC-ND 4.0, which permits non-commercial distribution of unaltered excerpts with credit.
+      Retrieved chunks carry this attribution.</p>`;
+  }
+
   // build recipe
-  html += '<h2>How it was built</h2><div class="card"><p style="margin-top:0">Source: <b>' +
-    esc(d.source) + '</b> → cached locally to <code>' + esc(d.cache_file) +
-    '</code> → chunked &amp; embedded into the index.</p><p style="margin-bottom:6px">Search query:</p><pre>' +
-    esc(d.query) + '</pre></div>';
+  html += '<h2>How it was built</h2><div class="card"><p style="margin-top:0"><b>Research layer:</b> ' +
+    esc(d.source) + ' → cached locally to <code>' + esc(d.cache_file) +
+    '</code> → chunked &amp; embedded.</p><p style="margin-bottom:6px">Search query:</p><pre>' +
+    esc(d.query) + '</pre>' +
+    '<p style="margin-bottom:0"><b>Reference layer:</b> StatPearls from the NCBI Literature ' +
+    'Archive (<code>ftp.ncbi.nlm.nih.gov/pub/litarch</code>) → orthopedic chapters selected ' +
+    'by title → section-aware chunks. Not available via PMC or efetch — the FTP archive is the ' +
+    'route NCBI provides for bulk text mining.</p></div>';
 
   // samples
-  html += '<h2>Sample records</h2><div class="tablewrap"><table>' +
+  html += '<h2>Sample research papers</h2><div class="tablewrap"><table>' +
     '<thead><tr><th>PMID</th><th>Year</th><th>Journal</th><th>Title</th></tr></thead><tbody>' +
     d.samples.map(s =>
       `<tr><td><a href="https://pubmed.ncbi.nlm.nih.gov/${esc(s.pmid)}/" target="_blank" rel="noopener">${esc(s.pmid)}</a></td>
