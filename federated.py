@@ -1,6 +1,6 @@
 """Federated retrieval across independent, access-gated silos.
 
-Adelphi-style "federated discovery across silos": the corpus is partitioned into
+"Federated discovery across silos": the corpus is partitioned into
 N independent Chroma collections, each standing in for a separate source/org that
 doesn't share its raw index. A query fans out across the silos the user is CLEARED
 to query, each silo is searched independently (with the same per-document access

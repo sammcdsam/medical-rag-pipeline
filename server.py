@@ -22,11 +22,15 @@ Retrieval works with NO API key (you'll see the retrieved chunks). Set
 ANTHROPIC_API_KEY in the environment before launching to also get Claude's
 grounded answer + citations.
 """
+import base64
+import hashlib
+import hmac
 import json
 import os
+import time
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -38,6 +42,126 @@ import llm
 from query import get_collection, retrieve, answer, _provenance
 
 app = FastAPI(title="Minimal RAG demo")
+
+# --- Public demo mode --------------------------------------------------------
+# The internet-facing instance runs with PUBLIC_MODE=1: visitors who have the
+# access code (printed on the resume) get a small number of answers from the
+# LOCAL model, and everything else — the write-up pages, the agent runner, the
+# Claude backend — is switched off. A normal `python server.py` (no PUBLIC_MODE)
+# is completely unaffected, so the private instance on :8022 keeps full features
+# while the tunneled instance on :8023 is locked down.
+#
+#   PUBLIC_MODE=1 uvicorn server:app --host 127.0.0.1 --port 8023
+#
+# Design notes (the "why" of each piece):
+#   * The gate trades the password for an HMAC-SIGNED cookie — stateless, no
+#     accounts, no DB. The signature means a visitor can't mint or edit their
+#     own session; the quota inside it can only change server-side.
+#   * The quota is enforced HERE, not in the browser: anything client-side is
+#     editable by whoever opens devtools.
+#   * backend is FORCED to "local" server-side for the same reason — a crafted
+#     POST could otherwise select "claude" and spend API money.
+#   * A per-IP daily cap backstops the shared password (one password will be on
+#     many resumes; clearing cookies re-arms the 2-question quota, the IP cap
+#     bounds how far that goes). In-memory: restarting the server resets it,
+#     which is fine for a demo.
+PUBLIC_MODE = os.environ.get("PUBLIC_MODE", "") == "1"
+DEMO_PASSWORD = os.environ.get("DEMO_PASSWORD", "")
+# Admin codes (comma-separated): full access — unlimited questions, Claude
+# backend, agent runner, write-up pages. Hand these out accordingly.
+ADMIN_PASSWORDS = [p.strip() for p in os.environ.get("ADMIN_PASSWORD", "").split(",") if p.strip()]
+DEMO_SECRET = os.environ.get("DEMO_SECRET", "")          # cookie-signing key (.env)
+DEMO_QUESTIONS = int(os.environ.get("DEMO_QUESTIONS", "2"))   # answers per unlock
+DEMO_IP_DAILY = int(os.environ.get("DEMO_IP_DAILY", "20"))    # answers per IP per day
+DEMO_UNLOCKS_DAILY = 15                                       # password tries per IP per day
+
+if PUBLIC_MODE and not (DEMO_PASSWORD and DEMO_SECRET):
+    raise RuntimeError("PUBLIC_MODE=1 needs DEMO_PASSWORD and DEMO_SECRET set (see .env)")
+
+_ip_counters: dict[str, dict] = {}   # ip -> {"day": int, "answers": int, "unlocks": int}
+
+
+def _client_ip(request: Request) -> str:
+    # Behind the Cloudflare tunnel every TCP connection comes from localhost;
+    # the visitor's real address arrives in CF-Connecting-IP.
+    return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
+
+
+def _ip_bucket(ip: str) -> dict:
+    today = int(time.time() // 86400)
+    b = _ip_counters.get(ip)
+    if b is None or b["day"] != today:
+        b = _ip_counters[ip] = {"day": today, "answers": 0, "unlocks": 0}
+    return b
+
+
+def _sign(payload: str) -> str:
+    return hmac.new(DEMO_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _issue_session(used: int, admin: bool = False) -> str:
+    """Session token = base64(json) + '.' + HMAC. Self-contained and tamper-evident.
+    The admin flag rides INSIDE the signed payload, so it can't be self-granted."""
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"iat": int(time.time()), "used": used, "adm": admin}).encode()).decode()
+    return payload + "." + _sign(payload)
+
+
+def _read_session(request: Request) -> dict | None:
+    """Return the session dict if the cookie verifies, else None."""
+    token = request.cookies.get("demo_session", "")
+    payload, _, sig = token.partition(".")
+    if not payload or not hmac.compare_digest(_sign(payload), sig):
+        return None
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return None
+
+
+def _set_session(response: Response, used: int, admin: bool = False) -> None:
+    response.set_cookie("demo_session", _issue_session(used, admin),
+                        max_age=7 * 24 * 3600, httponly=True, samesite="lax")
+
+
+def _is_admin(request: Request) -> bool:
+    sess = _read_session(request)
+    return bool(sess and sess.get("adm"))
+
+
+class Unlock(BaseModel):
+    password: str
+
+
+@app.post("/api/unlock")
+def api_unlock(u: Unlock, request: Request, response: Response):
+    """Trade the resume access code for a signed session cookie."""
+    if not PUBLIC_MODE:
+        raise HTTPException(404)
+    bucket = _ip_bucket(_client_ip(request))
+    if bucket["unlocks"] >= DEMO_UNLOCKS_DAILY:
+        raise HTTPException(429, "Too many attempts today — try again tomorrow.")
+    bucket["unlocks"] += 1
+    pw = u.password.strip()
+    # An admin code unlocks the full private experience through the public
+    # URL: no quota, no forced-local, all pages. No ADMIN_PASSWORD in .env
+    # disables it entirely; compare_digest keeps every check timing-safe.
+    if any(hmac.compare_digest(pw, a) for a in ADMIN_PASSWORDS):
+        _set_session(response, used=0, admin=True)
+        return {"ok": True, "remaining": None, "admin": True}
+    if not hmac.compare_digest(pw, DEMO_PASSWORD):
+        raise HTTPException(401, "Wrong access code.")
+    _set_session(response, used=0)
+    return {"ok": True, "remaining": DEMO_QUESTIONS}
+
+
+@app.post("/api/signout")
+def api_signout(response: Response):
+    """Drop the session cookie — back to the gate (where a different code,
+    e.g. the admin one, can be entered)."""
+    response.delete_cookie("demo_session")
+    return {"ok": True}
+
 
 # --- Shared state ----------------------------------------------------------
 # Load the Chroma collection once and reuse it across requests (the embedding
@@ -75,10 +199,24 @@ class Query(BaseModel):
 
 
 @app.get("/api/config")
-def api_config():
+def api_config(request: Request):
     """What's under the hood — the page shows this, and it's where future
     pluggable model 'versions' will surface automatically."""
+    # Public mode: tell the page it's the locked-down demo and how many
+    # questions this session has left, so the UI can show an honest counter.
+    # An admin session gets NO public flag at all — the page renders exactly
+    # like the private instance.
+    public = {}
+    if PUBLIC_MODE:
+        # Anyone viewing the page in public mode has a session (the gate saw to
+        # that), so offer sign-out — it's how I switch a browser to the admin code.
+        public = {"can_signout": True}
+    if PUBLIC_MODE and not _is_admin(request):
+        sess = _read_session(request)
+        public.update({"public": True,
+                       "remaining": max(0, DEMO_QUESTIONS - sess["used"]) if sess else 0})
     return {
+        **public,
         "embedder": config.EMBED_MODEL,
         "llm": config.CLAUDE_MODEL,
         "local_model": config.LOCAL_MODEL,
@@ -113,8 +251,26 @@ def api_config():
 
 
 @app.post("/api/query")
-def api_query(q: Query):
+def api_query(q: Query, request: Request, response: Response):
     """question -> (access pre-filter) -> retrieve top-k (optionally reranked) -> answer + citations."""
+    # Public demo: session + quota checks, and force the free local backend.
+    # All of this happens server-side — the client's word is never trusted.
+    sess = None
+    if PUBLIC_MODE:
+        sess = _read_session(request)
+        if sess is None:
+            raise HTTPException(401, "Enter the access code first.")
+        if sess.get("adm"):
+            sess = None              # admin: no quota, no forced backend — as private
+        else:
+            if sess["used"] >= DEMO_QUESTIONS:
+                raise HTTPException(429, "Question limit reached for this session.")
+            bucket = _ip_bucket(_client_ip(request))
+            if bucket["answers"] >= DEMO_IP_DAILY:
+                raise HTTPException(429, "Daily limit reached — try again tomorrow.")
+            q.backend = "local"      # never the paid API, whatever the client sent
+            q.k = min(q.k, 8)
+
     # Access control: if a known principal is selected, build the pre-filter so
     # unauthorized chunks never enter the candidate set (see access.py).
     user = access.USERS.get(q.user) if q.user else None
@@ -165,6 +321,16 @@ def api_query(q: Query):
     except Exception as e:
         result["answer"] = f"(generation error: {e})"
 
+    # Public demo: an ANSWERED question spends one from the quota — the server
+    # re-issues the signed cookie with the new count (a failed generation is
+    # free, and an admin session — sess None'd above — never pays).
+    if PUBLIC_MODE and sess is not None:
+        if result["answered"]:
+            sess["used"] += 1
+            _set_session(response, used=sess["used"])
+            _ip_bucket(_client_ip(request))["answers"] += 1
+        result["remaining"] = max(0, DEMO_QUESTIONS - sess["used"])
+
     return result
 
 
@@ -175,12 +341,15 @@ class AgentQuery(BaseModel):
 
 
 @app.post("/api/agent")
-def api_agent(q: AgentQuery):
+def api_agent(q: AgentQuery, request: Request):
     """Run the agentic loop (agent.py) and return its trace, answer, and evidence.
 
     Slow (several Claude calls) — the UI shows a running state. The user's
     clearance is bound to the tools inside agent.run(), not passed by the model.
     """
+    if PUBLIC_MODE and not _is_admin(request):
+        # The agent loop burns several paid Claude calls per run — not for strangers.
+        raise HTTPException(403, "The agent runner is disabled in the public demo.")
     import agent
     user = access.USERS.get(q.user) or access.USERS["director"]
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -210,9 +379,18 @@ def api_agent(q: AgentQuery):
     }
 
 
+def _private(request: Request):
+    """In public mode the write-up pages/APIs don't exist — 404, not 403, so the
+    public surface doesn't even advertise that there's something to unlock.
+    An admin session (my own access code) sees everything."""
+    if PUBLIC_MODE and not _is_admin(request):
+        raise HTTPException(404)
+
+
 @app.get("/api/eval")
-def api_eval():
+def api_eval(request: Request):
     """Latest eval_ortho.py results (empty if it hasn't been run yet)."""
+    _private(request)
     path = Path(__file__).parent / "eval_results.json"
     if path.exists():
         return json.loads(path.read_text())
@@ -220,8 +398,9 @@ def api_eval():
 
 
 @app.get("/api/corpus")
-def api_corpus():
+def api_corpus(request: Request):
     """Descriptive stats about the corpus, from the local cache + the index."""
+    _private(request)
     import statistics
 
     cache = Path(config.CORPUS_CACHE)
@@ -279,28 +458,51 @@ def api_corpus():
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(request: Request):
+    # Public mode gates the page ITSELF, not just the API: without a valid
+    # session cookie a visitor only ever receives the password form.
+    if PUBLIC_MODE and _read_session(request) is None:
+        return GATE_HTML
     return HTML
 
 
 @app.get("/eval", response_class=HTMLResponse)
-def eval_page():
+def eval_page(request: Request):
+    _private(request)
     return EVAL_HTML
 
 
 @app.get("/corpus", response_class=HTMLResponse)
-def corpus_page():
+def corpus_page(request: Request):
+    _private(request)
     return CORPUS_HTML
 
 
 @app.get("/security", response_class=HTMLResponse)
-def security_page():
+def security_page(request: Request):
+    _private(request)
     return SECURITY_HTML
 
 
 @app.get("/agent", response_class=HTMLResponse)
-def agent_page():
+def agent_page(request: Request):
+    _private(request)
     return AGENT_HTML
+
+
+@app.get("/interview", response_class=HTMLResponse)
+def interview_page(request: Request):
+    # Unlike the other write-ups this stays 404 on the public instance even for
+    # ADMIN sessions — admin codes get shared, personal prep notes don't.
+    if PUBLIC_MODE:
+        raise HTTPException(404)
+    # Personal interview-prep notes live in a gitignored local file — the page
+    # exists only on machines that have it, never in the public repo.
+    try:
+        from private_interview import INTERVIEW_HTML
+    except ImportError:
+        return HTMLResponse("Not found", status_code=404)
+    return INTERVIEW_HTML
 
 
 # --- Frontend --------------------------------------------------------------
@@ -312,6 +514,12 @@ HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Minimal RAG demo</title>
+<!-- Self-hosted Umami analytics. data-domains means it ONLY reports when the
+     page is served as rag.mcdevitt.page — the private :8022 instance and
+     localhost testing never send a beacon. -->
+<script defer src="https://analytics.mcdevitt.page/script.js"
+        data-website-id="e63d9d10-fb95-4e88-8c80-043245420edc"
+        data-domains="rag.mcdevitt.page"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -330,9 +538,11 @@ HTML = """<!doctype html>
            background: #1b2430; color: #9fb2c8; border: 1px solid #232b36; }
   .badge b { color: #cfe0f3; font-weight: 600; }
   main { max-width: 820px; margin: 0 auto; padding: 24px; }
-  form { display: flex; gap: 10px; align-items: center; }
-  input[type=text] { flex: 1; padding: 11px 13px; border-radius: 8px;
-    border: 1px solid #2a3441; background: #131a22; color: #e6edf3; font-size: 15px; }
+  form { display: flex; flex-direction: column; gap: 10px; }
+  textarea { width: 100%; padding: 11px 13px; border-radius: 8px; font: inherit;
+    border: 1px solid #2a3441; background: #131a22; color: #e6edf3; font-size: 15px;
+    resize: vertical; min-height: 76px; }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .kbox { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #9fb2c8; }
   input[type=number] { width: 56px; padding: 8px; border-radius: 8px;
     border: 1px solid #2a3441; background: #131a22; color: #e6edf3; }
@@ -346,8 +556,11 @@ HTML = """<!doctype html>
   .card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase;
     letter-spacing: .06em; color: #7d8fa3; }
   .answer { white-space: pre-wrap; }
-  .cite { font-size: 13px; color: #9fb2c8; margin-top: 6px; padding-left: 10px;
+  .answer .ans-h { display: block; font-weight: 700; color: #cfe0f3; margin: 8px 0 0; }
+  .cite { font-size: 13px; color: #9fb2c8; margin-top: 10px; padding-left: 10px;
     border-left: 2px solid #2f81f7; }
+  .cite b { color: #cfe0f3; }
+  .cite .q { margin-top: 3px; }
   .chunk { padding: 10px 0; border-top: 1px solid #1e2731; }
   .chunk:first-of-type { border-top: 0; }
   .chunk .meta { font-size: 12px; color: #7d8fa3; display: flex; gap: 12px;
@@ -369,6 +582,10 @@ HTML = """<!doctype html>
   .cls-CONFIDENTIAL { background: #2e2a12; color: #d0b23a; border: 1px solid #52481c; }
   .cls-SECRET { background: #33230f; color: #e0913a; border: 1px solid #5a3d18; }
   .cls-TOP_SECRET { background: #3a1620; color: #f0637e; border: 1px solid #5e2233; }
+  /* Public demo mode: the write-up nav and the model picker don't exist for
+     visitors (the server enforces this too — hiding is just honest UI). */
+  body.public .nav, body.public #backendBox { display: none; }
+  .quota { background: #2e2a12; color: #d0b23a; border-color: #52481c; }
 </style>
 </head>
 <body>
@@ -380,27 +597,32 @@ HTML = """<!doctype html>
       <a class="navlink" href="/security">Security &rarr;</a>
       <a class="navlink" href="/corpus">Corpus &rarr;</a>
       <a class="navlink" href="/eval">Eval &rarr;</a>
+      <a class="navlink" id="navInterview" href="/interview">Interview &rarr;</a>
     </nav>
+    <a class="navlink hidden" id="signout" href="#" title="Drop this session and return to the access-code gate">sign out</a>
   </div>
   <div class="badges" id="badges"></div>
 </header>
 <main>
   <form id="f">
-    <input type="text" id="q" placeholder="Ask an orthopedic question…"
-           value="Surgical management of bone sarcoma and musculoskeletal oncology" autofocus>
-    <div class="kbox" title="Retrieve AS this principal — access-control pre-filter by clearance + need-to-know">role
-      <select id="role"><option value="">— none —</option></select></div>
-    <div class="kbox">model
-      <select id="backend">
-        <option value="claude">Claude (API)</option>
-        <option value="local">Local (offline)</option>
-      </select></div>
-    <div class="kbox">top-k <input type="number" id="k" min="1" max="20" value="5"></div>
-    <label class="kbox" title="Two-stage retrieval: pull a wider candidate pool, then re-rank with a cross-encoder">
-      <input type="checkbox" id="rerank"> rerank</label>
-    <label class="kbox" title="Federated: fan the query across access-gated silos and merge the results">
-      <input type="checkbox" id="federated"> federated</label>
-    <button id="go" type="submit">Ask</button>
+    <textarea id="q" rows="3" autofocus
+      placeholder="Ask an orthopedic question… (Enter to ask, Shift+Enter for a new line)"
+      >Surgical management of bone sarcoma and musculoskeletal oncology</textarea>
+    <div class="controls">
+      <div class="kbox" title="Retrieve AS this principal — access-control pre-filter by clearance + need-to-know">role
+        <select id="role"><option value="">— none —</option></select></div>
+      <div class="kbox" id="backendBox">model
+        <select id="backend">
+          <option value="local">Local (offline)</option>
+          <option value="claude">Claude (API)</option>
+        </select></div>
+      <div class="kbox">top-k <input type="number" id="k" min="1" max="20" value="5"></div>
+      <label class="kbox" title="Two-stage retrieval: pull a wider candidate pool, then re-rank with a cross-encoder">
+        <input type="checkbox" id="rerank"> rerank</label>
+      <label class="kbox" title="Federated: fan the query across access-gated silos and merge the results">
+        <input type="checkbox" id="federated"> federated</label>
+      <button id="go" type="submit">Ask</button>
+    </div>
   </form>
   <div class="access-line" id="accessLine"></div>
   <div class="chips" id="examples"></div>
@@ -428,13 +650,30 @@ let ROLES = {}, SILOS = [], CLEARANCES = [];
 
 // Show what's under the hood on load, and populate roles + example questions.
 fetch('/api/config').then(r => r.json()).then(c => {
-  $('badges').innerHTML =
-    `<span class="badge">embedder <b>${c.embedder}</b></span>` +
-    `<span class="badge">reranker <b>${c.reranker}</b></span>` +
-    `<span class="badge">Claude <b>${c.llm}</b></span>` +
-    `<span class="badge">local <b>${c.local_model}</b></span>` +
-    `<span class="badge">top-k <b>${c.top_k}</b></span>` +
-    `<span class="badge">Claude key <b>${c.has_key ? 'set' : 'not set'}</b></span>`;
+  // Public demo: no nav, no model picker (server forces local), quota badge.
+  if (c.public) {
+    document.body.classList.add('public');
+    $('backend').value = 'local';
+    $('badges').innerHTML =
+      `<span class="badge">embedder <b>${c.embedder}</b></span>` +
+      `<span class="badge">model <b>${c.local_model}</b> (runs on my GPU)</span>` +
+      `<span class="badge quota" id="quotaBadge"></span>`;
+    setQuota(c.remaining);
+  } else {
+    $('badges').innerHTML =
+      `<span class="badge">embedder <b>${c.embedder}</b></span>` +
+      `<span class="badge">reranker <b>${c.reranker}</b></span>` +
+      `<span class="badge">Claude <b>${c.llm}</b></span>` +
+      `<span class="badge">local <b>${c.local_model}</b></span>` +
+      `<span class="badge">top-k <b>${c.top_k}</b></span>` +
+      `<span class="badge">Claude key <b>${c.has_key ? 'set' : 'not set'}</b></span>`;
+  }
+  if (c.can_signout) {
+    $('signout').classList.remove('hidden');
+    // On the public instance even the admin view drops the Interview tab —
+    // prep notes don't belong on a screen I might share.
+    $('navInterview').remove();
+  }
   $('k').value = c.top_k;
 
   // Access-control roles → dropdown.
@@ -490,6 +729,30 @@ function updateAccessLine() {
 $('role').addEventListener('change', updateAccessLine);
 $('federated').addEventListener('change', updateAccessLine);
 
+// Public-demo quota display. null/undefined = not in public mode (no-op).
+function setQuota(remaining) {
+  const b = $('quotaBadge');
+  if (!b || remaining === null || remaining === undefined) return;
+  b.innerHTML = `questions left <b>${remaining}</b>`;
+  if (remaining <= 0) {
+    $('q').disabled = true; $('go').disabled = true;
+    $('q').value = '';
+    $('q').placeholder = 'Question limit reached — thanks for trying the demo!';
+  }
+}
+
+// Sign out (public mode only): clear the session cookie and land on the gate.
+$('signout').addEventListener('click', async e => {
+  e.preventDefault();
+  await fetch('/api/signout', { method: 'POST' });
+  location.href = '/';
+});
+
+// The question box is a textarea, so make Enter submit (Shift+Enter = newline).
+$('q').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('f').requestSubmit(); }
+});
+
 $('f').addEventListener('submit', async e => {
   e.preventDefault();
   const question = $('q').value.trim();
@@ -503,22 +766,45 @@ $('f').addEventListener('submit', async e => {
                              user: $('role').value || null, federated: $('federated').checked })
     });
     const data = await res.json();
+    if (!res.ok) {
+      // Quota / session errors come back as {"detail": "..."} with a 4xx status.
+      $('answerCard').classList.remove('hidden');
+      $('answer').textContent = data.detail || ('Error ' + res.status);
+      return;
+    }
     render(data);
+    setQuota(data.remaining);
+    if (window.umami) umami.track('question', { backend: data.backend, answered: data.answered });
   } catch (err) {
     $('answerCard').classList.remove('hidden');
     $('answer').textContent = 'Error: ' + err;
   } finally {
-    $('go').disabled = false; $('go').textContent = 'Ask';
+    if (!$('q').disabled) { $('go').disabled = false; }
+    $('go').textContent = 'Ask';
   }
 });
+
+// Light markdown for the answer: headings, **bold**, bullets. Escape FIRST,
+// then add markup — so model output can never inject live HTML.
+function fmtAnswer(t) {
+  return escapeHtml(t)
+    .replace(/^#+ +(.+)$/gm, '<span class="ans-h">$1</span>')
+    .replace(/[*][*](.+?)[*][*]/g, '<b>$1</b>')
+    .replace(/^[-*] +/gm, '• ');
+}
 
 function render(data) {
   // Answer
   $('answerCard').classList.remove('hidden');
   $('answerHead').textContent = data.model ? ('Answer — ' + data.backend + ' · ' + data.model) : 'Answer';
-  $('answer').textContent = data.answer || '';
-  $('cites').innerHTML = (data.citations || [])
-    .map(c => `<div class="cite">${escapeHtml(c.title)}: "${escapeHtml(c.text)}"</div>`).join('');
+  $('answer').innerHTML = fmtAnswer(data.answer || '');
+  // Citations grouped by source paper, so one paper cited five times reads as
+  // one entry with five quoted spans — not five repeated titles.
+  const bySource = {};
+  (data.citations || []).forEach(c => (bySource[c.title] = bySource[c.title] || []).push(c.text));
+  $('cites').innerHTML = Object.entries(bySource).map(([title, quotes]) =>
+    `<div class="cite"><b>${escapeHtml(title)}</b>` +
+    quotes.map(q => `<div class="q">“${escapeHtml(q)}”</div>`).join('') + `</div>`).join('');
 
   // Federation report (which silos were queried vs skipped at the silo level)
   if (data.federation) {
@@ -1140,6 +1426,8 @@ fetch('/api/config').then(r => r.json()).then(c => {
 </html>"""
 
 
+
+
 # --- /agent explainer + live runner ----------------------------------------
 # Explains how the agentic RAG loop works (agent.py) and lets you run it live:
 # pick a role, ask a question, watch the tool-call trace, the answer, and the
@@ -1375,6 +1663,80 @@ $('go').addEventListener('click', async () => {
   } finally {
     $('go').disabled = false;
   }
+});
+</script>
+</body>
+</html>"""
+
+
+# --- Public-mode gate page ---------------------------------------------------
+# What a visitor sees before unlocking: a one-field password form. The real
+# gate is server-side (index() won't serve the app without a valid signed
+# cookie) — this page is just the front door.
+GATE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orthopedic RAG demo — Sam McDevitt</title>
+<script defer src="https://analytics.mcdevitt.page/script.js"
+        data-website-id="e63d9d10-fb95-4e88-8c80-043245420edc"
+        data-domains="rag.mcdevitt.page"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.6 system-ui, sans-serif; background: #0e1116; color: #e6edf3;
+         min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+  .card { max-width: 480px; background: #131a22; border: 1px solid #232b36;
+          border-radius: 12px; padding: 28px 30px; }
+  h1 { margin: 0 0 10px; font-size: 20px; }
+  p { color: #c3d0de; margin: 10px 0; }
+  .muted { color: #7d8fa3; font-size: 13.5px; }
+  form { display: flex; gap: 10px; margin: 18px 0 6px; }
+  input { flex: 1; padding: 11px 13px; border-radius: 8px; border: 1px solid #2a3441;
+          background: #0e1116; color: #e6edf3; font-size: 15px; }
+  button { padding: 11px 18px; border: 0; border-radius: 8px; cursor: pointer;
+           background: #2f81f7; color: #fff; font-size: 15px; font-weight: 600; }
+  button:disabled { opacity: .5; }
+  .err { color: #f0637e; font-size: 13.5px; min-height: 20px; }
+  a { color: #2f81f7; text-decoration: none; } a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Orthopedic RAG demo</h1>
+  <p>A retrieval-augmented generation system over ~27,000 live PubMed orthopedic
+  abstracts: local embeddings, vector search, access-controlled retrieval, and a
+  local LLM — all running on my own GPU, on my own hardware.</p>
+  <p class="muted">If you have my resume, enter the access code on it to ask a
+  couple of questions and watch the retrieval happen.</p>
+  <form id="f">
+    <input id="pw" type="password" placeholder="Access code" autofocus autocomplete="off">
+    <button id="go" type="submit">Enter</button>
+  </form>
+  <div class="err" id="err"></div>
+  <p class="muted">Sam McDevitt · <a href="https://mcdevitt.page">mcdevitt.page</a> ·
+  <a href="https://github.com/sammcdsam/medical-rag-pipeline">source on GitHub</a></p>
+</div>
+<script>
+document.getElementById('f').addEventListener('submit', async e => {
+  e.preventDefault();
+  const go = document.getElementById('go'), err = document.getElementById('err');
+  go.disabled = true; err.textContent = '';
+  try {
+    const res = await fetch('/api/unlock', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ password: document.getElementById('pw').value })
+    });
+    if (res.ok) {
+      if (window.umami) umami.track('unlock');
+      location.reload(); return;
+    }
+    const d = await res.json();
+    if (window.umami) umami.track('unlock-failed');
+    err.textContent = d.detail || ('Error ' + res.status);
+  } catch (ex) { err.textContent = 'Error: ' + ex; }
+  go.disabled = false;
 });
 </script>
 </body>
