@@ -305,6 +305,10 @@ def api_query(q: Query, request: Request, response: Response):
             # peer-reviewed and shouldn't look like it is.
             "source_type": m.get("source_type"),
             "url": m.get("url"),
+            # StatPearls is CC BY-NC-ND: distribution is permitted non-commercially
+            # *with credit*, so the attribution travels with the chunk to the page.
+            "attribution": m.get("source"),
+            "section": m.get("section"),
             "text": t,
         })
     result = {
@@ -591,6 +595,7 @@ HTML = """<!doctype html>
   .stype { font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; letter-spacing: .03em; }
   .st-reference { background: #14263a; color: #6cb6ff; border: 1px solid #1f4468; }
   .st-research { background: #221b33; color: #b083f0; border: 1px solid #3b2d5c; }
+  .attrib { font-size: 11.5px; color: #6d7f92; margin-top: 5px; font-style: italic; }
   /* Public demo mode: the write-up nav and the model picker don't exist for
      visitors (the server enforces this too — hiding is just honest UI). */
   body.public .nav, body.public #backendBox { display: none; }
@@ -846,6 +851,8 @@ function render(data) {
       ? `<span class="stype st-${ch.source_type}" title="${ch.source_type === 'reference'
           ? 'Encyclopedic background (Wikipedia, CC BY-SA) — not peer-reviewed'
           : 'Peer-reviewed research from PubMed'}">${ch.source_type}</span>` : '';
+    // Section heading (StatPearls chapters / full-text papers are section-chunked).
+    const sec = ch.section ? `<span class="muted">§ ${escapeHtml(ch.section)}</span>` : '';
     return `<div class="chunk">
       <div class="meta">
         <span>#${ch.rank}</span>
@@ -854,8 +861,9 @@ function render(data) {
         <span>dist ${ch.distance.toFixed(3)}</span>
         <span class="simbar"><span style="width:${(sim*100).toFixed(0)}%"></span></span>
       </div>
-      ${ch.title ? `<div class="ctitle">${escapeHtml(ch.title)}</div>` : ''}
+      ${ch.title ? `<div class="ctitle">${escapeHtml(ch.title)}${sec ? ' — ' + sec : ''}</div>` : ''}
       <div class="text">${escapeHtml(ch.text)}</div>
+      ${ch.attribution ? `<div class="attrib">${escapeHtml(ch.attribution)}</div>` : ''}
     </div>`;
   }).join('');
 }

@@ -143,6 +143,15 @@ WIKI_CATEGORIES = {
 REFERENCE_CACHE = str(Path(__file__).parent / "ortho_reference.jsonl")
 REFERENCE_TARGET = 400   # background articles to cache
 
+# StatPearls — a PEER-REVIEWED clinical reference, the better background layer
+# (Wikipedia is the fallback: fine content, but not peer-reviewed). Chapters are
+# section-structured exactly like the background a clinician wants: Indications,
+# Technique, Complications. Sourced from NCBI's Literature Archive bulk tarball,
+# NOT PMC/efetch — see statpearls.py for the routes that don't work.
+# Licence CC BY-NC-ND 4.0: distribution of unaltered excerpts is permitted for
+# NON-COMMERCIAL use WITH CREDIT — every chunk carries the attribution string.
+STATPEARLS_CACHE = str(Path(__file__).parent / "ortho_statpearls.jsonl")
+
 # --- Retrieval -------------------------------------------------------------
 TOP_K = 5
 

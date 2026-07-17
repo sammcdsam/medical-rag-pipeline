@@ -35,6 +35,8 @@ def _provenance(meta: dict) -> tuple[str, str]:
         return "PMID", meta["pmid"]
     if meta.get("pageid"):
         return "Wikipedia", meta["pageid"]
+    if meta.get("chapter_id"):
+        return "StatPearls", meta["chapter_id"]
     return "pubid", str(meta.get("pubid", "?"))
 
 

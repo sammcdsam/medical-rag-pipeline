@@ -13,3 +13,5 @@ ortho_fulltext.jsonl
 private_interview.py
 .claude/settings.local.json.tmp.*
 ortho_reference.jsonl
+ortho_statpearls.jsonl
+statpearls.tar.gz
