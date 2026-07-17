@@ -1171,6 +1171,11 @@ fetch('/api/eval').then(r => r.json()).then(d => {
          is noise, not a finding — an LLM judge over ${d.n} questions simply cannot resolve it. The useful
          signal in this table is often the <b>stdev</b>: a model with a fat left tail produces the occasional
          badly-grounded answer, which matters more on a medical corpus than a point of mean.</p>`
+      + `<p class="note" style="margin-top:14px"><b>Why this measurement exists.</b> The choice of local model
+         was first made by reading two answers and judging the prose — and that read got the ranking right for
+         the wrong reason. Eyeballing cannot see a 16-point grounding gap, and it cannot tell a real gap from
+         sampling noise; only the paired run can. The same harness previously reversed a "the reranker helps"
+         claim once it was run paired. Measure the thing you are about to ship.</p>`
       + `<div class="stamp">corpus <code>${d.corpus}</code> · ${d.corpus_chunks.toLocaleString()} chunks · `
       + `${d.n} questions · top-${d.k} · question mode: <b>${mode}</b> · backend `
       + `<b>${d.answer_backend}</b> · judge ${d.model} · ${d.generated_at}</div>`;
