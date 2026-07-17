@@ -1271,7 +1271,11 @@ CORPUS_HTML = """<!doctype html>
          align-items: center; gap: 12px; margin: 6px 0; font-size: 13px; }
   .bar .lab { color: #9fb2c8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .bar .track { background: #0e1116; border-radius: 4px; height: 16px; overflow: hidden; }
-  .bar .fill { height: 100%; background: #2f81f7; border-radius: 4px; }
+  /* display:block is load-bearing: .fill is a <span>, and an INLINE element
+     ignores width/height outright — so the fill rendered at zero size and every
+     chart was just its empty near-black track. (.track escapes this only because
+     it's a grid item of .bar, which blockifies it.) */
+  .bar .fill { display: block; height: 100%; background: #2f81f7; border-radius: 4px; }
   .bar .fill.ref { background: #6cb6ff; }   /* reference layer, matching the demo page's tag */
   .bar .n { text-align: right; color: #7d8fa3; font-variant-numeric: tabular-nums; }
   /* Journal names are long; give them more room but keep the same shape. */
